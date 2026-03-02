@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: fix-lab-server
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ELEVEN_LABS_API_KEY
+        sync: false
+      - key: FIX_LAB_SECRET
+        sync: false
+      - key: PORT
+        value: 8000
+    preDeployCommand: apt-get update && apt-get install -y ffmpeg
