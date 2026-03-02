@@ -265,12 +265,12 @@ async def run_regeneration_job(job_id: str, bite_languages: Dict[str, List[str]]
                 result["status"] = "uploading"
                 logger.info(f"Job {job_id}: Generated {len(audio_bytes)} bytes for {bite_id}/{lang}")
 
-                # 4b. Calculate audio duration using pydub
+                # 4b. Calculate audio duration using mutagen (pure Python, no ffmpeg needed)
                 try:
                     from io import BytesIO
-                    from pydub import AudioSegment
-                    audio_segment = AudioSegment.from_mp3(BytesIO(audio_bytes))
-                    total_seconds = len(audio_segment) / 1000.0
+                    from mutagen.mp3 import MP3
+                    mp3 = MP3(BytesIO(audio_bytes))
+                    total_seconds = mp3.info.length
                     minutes = int(total_seconds // 60)
                     seconds = int(total_seconds % 60)
                     duration_str = f"{minutes:02d}:{seconds:02d}"
