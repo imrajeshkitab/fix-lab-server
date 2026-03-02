@@ -266,7 +266,7 @@ async def get_pending_items(job_id: str) -> list:
 
 async def update_job_item(item_id: str, data: dict):
     """Update a job item's status and result."""
-    await sb_patch("fix_lab_job_items", item_id, {**data, "updated_at": datetime.now(timezone.utc).isoformat()})
+    await sb_patch("fix_lab_job_items", item_id, data)
 
 
 async def update_job(job_id: str, data: dict):
@@ -522,6 +522,12 @@ async def start_regeneration(
 async def get_job_status(job_id: str, x_fix_lab_key: str = Header(...)):
     """Poll job progress. Returns job info + all item results."""
     verify_secret(x_fix_lab_key)
+
+    # Validate UUID format
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid job ID format")
 
     job = await get_job(job_id)
     if not job:
