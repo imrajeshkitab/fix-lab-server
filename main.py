@@ -1,12 +1,17 @@
 """
 Fix Lab Backend Server
 ======================
-FastAPI server that handles audio regeneration for the Fix Lab feature.
+FastAPI server that handles audio regeneration for the Fix Lab feature,
+and RMS → Linear status sync.
 
 Endpoints:
-  GET  /                            — Health check
-  POST /api/fix-lab/regenerate     — Start audio regeneration for selected items
-  GET  /api/fix-lab/jobs/{job_id}  — Poll job progress
+  GET  /                                    — Health check
+  POST /api/fix-lab/regenerate              — Start audio regeneration for selected items
+  GET  /api/fix-lab/jobs/{job_id}           — Poll job progress
+  POST /api/linear-sync/bites              — Sync completed bites → Linear Approved
+  POST /api/linear-sync/summaries          — Sync completed summaries → Linear Approved
+  GET  /api/linear-sync/status/{type}      — Compare RMS vs Linear statuses
+  GET  /api/linear-sync/jobs/{job_id}      — Poll sync job progress
 
 Auth: x-fix-lab-key header must match FIX_LAB_SECRET env var.
 
@@ -42,6 +47,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET", "kitab-fix-lab-2024")
+LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 PORT = int(os.getenv("PORT", "8642"))
 
 # Supabase REST headers (service role bypasses RLS)
@@ -561,6 +567,612 @@ async def get_job_status(job_id: str, x_fix_lab_key: str = Header(...)):
         "failed": job["failed"],
         "results": results,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LINEAR SYNC — RMS content_assignments → Linear issue status
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Linear Constants ────────────────────────────────────────────────────────
+
+LINEAR_API_URL = "https://api.linear.app/graphql"
+
+# Approved status IDs per team
+LINEAR_APPROVED_STATUS = {
+    "BYT":   "f7540a43-23cd-47db-92c2-d345b804b325",
+    "BYTHN": "5f7b0e54-9c37-49c8-a8cf-ef4a6cded613",
+    "SUM":   "c392b2c9-9487-463b-9c0d-2a86049ae3e8",
+    "SUMHN": "66e0fa4f-14a4-42f5-89fc-67c5a77e158c",
+}
+
+# Statuses to skip (already final)
+LINEAR_SKIP_STATUSES = {"Approved", "Published", "Canceled", "Rejected", "Duplicate"}
+
+# Max concurrent Linear API calls
+LINEAR_SEMAPHORE_LIMIT = 20
+
+# ── Linear Sync: In-memory job store ────────────────────────────────────────
+# Lightweight — no DB table needed, jobs are short-lived
+
+sync_jobs: Dict[str, Dict[str, Any]] = {}
+
+
+# ── Linear API Helpers ──────────────────────────────────────────────────────
+
+async def linear_graphql(query: str, variables: dict = None) -> Any:
+    """Execute a GraphQL query against the Linear API."""
+    r = await http_client.post(
+        LINEAR_API_URL,
+        headers={
+            "Authorization": LINEAR_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={"query": query, "variables": variables or {}},
+    )
+    if r.status_code != 200:
+        raise Exception(f"Linear API error: {r.status_code} {r.text[:300]}")
+    data = r.json()
+    if "errors" in data:
+        raise Exception(f"Linear GraphQL error: {data['errors']}")
+    return data.get("data")
+
+
+async def linear_get_issue(identifier: str) -> Optional[dict]:
+    """Fetch a Linear issue by its identifier (e.g. BYT-123)."""
+    query = """
+    query($filter: IssueFilter) {
+        issues(filter: $filter, first: 1) {
+            nodes {
+                id
+                identifier
+                state { name }
+            }
+        }
+    }
+    """
+    variables = {
+        "filter": {
+            "number": {"eq": int(identifier.split("-")[1])},
+            "team": {"key": {"eq": identifier.split("-")[0]}},
+        }
+    }
+    data = await linear_graphql(query, variables)
+    nodes = data.get("issues", {}).get("nodes", [])
+    return nodes[0] if nodes else None
+
+
+async def linear_update_issue_status(issue_id: str, status_id: str) -> bool:
+    """Update a Linear issue's status."""
+    query = """
+    mutation($id: String!, $stateId: String!) {
+        issueUpdate(id: $id, input: { stateId: $stateId }) {
+            success
+        }
+    }
+    """
+    data = await linear_graphql(query, {"id": issue_id, "stateId": status_id})
+    return data.get("issueUpdate", {}).get("success", False)
+
+
+# ── Linear Sync: Build identifier for target team ──────────────────────────
+
+def build_linear_identifier(base_identifier: str, language: str, content_type: str) -> Optional[str]:
+    """
+    Build the target Linear identifier based on language.
+    e.g. BYT-123 + hi → BYTHN-123, SUM-456 + en → SUM-456
+    """
+    if not base_identifier or "-" not in base_identifier:
+        return None
+
+    parts = base_identifier.split("-", 1)
+    prefix = parts[0]  # BYT or SUM
+    number = parts[1]
+
+    if language == "hi":
+        # Map to Hindi team
+        if prefix == "BYT":
+            return f"BYTHN-{number}"
+        elif prefix == "SUM":
+            return f"SUMHN-{number}"
+        else:
+            return None
+    elif language == "en":
+        return base_identifier  # Already the right team
+    else:
+        return None
+
+
+def get_team_key_from_identifier(identifier: str) -> Optional[str]:
+    """Extract team key from Linear identifier, e.g. BYTHN-123 → BYTHN"""
+    if not identifier or "-" not in identifier:
+        return None
+    return identifier.split("-")[0]
+
+
+# ── Linear Sync: Worker ────────────────────────────────────────────────────
+
+async def process_single_sync_item(
+    sem: asyncio.Semaphore,
+    job_id: str,
+    assignment: dict,
+    content_row: dict,
+    language: str,
+    content_type: str,
+    dry_run: bool,
+) -> dict:
+    """Process a single assignment→Linear sync. Returns a result dict."""
+    async with sem:
+        base_identifier = content_row.get("linear_identifier")
+        target_identifier = build_linear_identifier(base_identifier, language, content_type)
+
+        result = {
+            "assignment_id": assignment["id"],
+            "content_id": assignment["content_id"],
+            "base_identifier": base_identifier,
+            "target_identifier": target_identifier,
+            "language": language,
+            "status": "pending",
+            "action": None,
+            "error": None,
+        }
+
+        if not target_identifier:
+            result["status"] = "skipped"
+            result["action"] = "no_identifier"
+            return result
+
+        try:
+            # Fetch current Linear issue status
+            issue = await linear_get_issue(target_identifier)
+            if not issue:
+                result["status"] = "skipped"
+                result["action"] = "issue_not_found"
+                return result
+
+            current_status = issue.get("state", {}).get("name", "")
+            result["current_status"] = current_status
+
+            if current_status in LINEAR_SKIP_STATUSES:
+                result["status"] = "skipped"
+                result["action"] = f"already_{current_status.lower()}"
+                return result
+
+            team_key = get_team_key_from_identifier(target_identifier)
+            approved_status_id = LINEAR_APPROVED_STATUS.get(team_key)
+
+            if not approved_status_id:
+                result["status"] = "error"
+                result["error"] = f"No approved status ID for team {team_key}"
+                return result
+
+            if dry_run:
+                result["status"] = "would_update"
+                result["action"] = f"{current_status} → Approved"
+                return result
+
+            # Actually update
+            success = await linear_update_issue_status(issue["id"], approved_status_id)
+            if success:
+                result["status"] = "updated"
+                result["action"] = f"{current_status} → Approved"
+            else:
+                result["status"] = "error"
+                result["error"] = "Update returned success=false"
+
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)[:300]
+
+        return result
+
+
+async def run_linear_sync_job(job_id: str, content_type: str, dry_run: bool):
+    """Background worker: sync completed assignments → Linear Approved."""
+    job = sync_jobs[job_id]
+    job["status"] = "running"
+    logger.info(f"Sync job {job_id}: Starting ({content_type}, dry_run={dry_run})")
+
+    try:
+        # 1. Fetch completed assignments for this content type
+        assignments = await sb_get(
+            f"content_assignments?content_type=eq.{content_type}&status=eq.completed&select=id,content_id,assigned_languages"
+        )
+        logger.info(f"Sync job {job_id}: Found {len(assignments)} completed {content_type} assignments")
+
+        if not assignments:
+            job["status"] = "completed"
+            job["message"] = "No completed assignments found"
+            return
+
+        # 2. Collect all content_ids and fetch content rows in bulk
+        content_ids = [a["content_id"] for a in assignments if a.get("content_id")]
+        table = "bites" if content_type == "bites" else "summaries"
+
+        # Fetch in batches (Supabase URL length limits)
+        content_map = {}
+        batch_size = 50
+        for i in range(0, len(content_ids), batch_size):
+            batch_ids = content_ids[i:i + batch_size]
+            ids_filter = ",".join(batch_ids)
+            rows = await sb_get(
+                f"{table}?id=in.({ids_filter})&select=id,linear_identifier,source_id"
+            )
+            for row in rows:
+                content_map[row["id"]] = row
+
+        logger.info(f"Sync job {job_id}: Fetched {len(content_map)} {table} rows")
+
+        # 3. Build list of sync tasks
+        sem = asyncio.Semaphore(LINEAR_SEMAPHORE_LIMIT)
+        tasks = []
+
+        for assignment in assignments:
+            content_id = assignment.get("content_id")
+            content_row = content_map.get(content_id)
+            if not content_row:
+                job["results"].append({
+                    "assignment_id": assignment["id"],
+                    "content_id": content_id,
+                    "status": "skipped",
+                    "action": "content_not_found",
+                })
+                job["skipped"] += 1
+                continue
+
+            # Get language from assigned_languages
+            langs = assignment.get("assigned_languages", [])
+            if isinstance(langs, str):
+                import json as _json
+                langs = _json.loads(langs)
+            language = langs[0] if langs else None
+
+            if not language:
+                job["results"].append({
+                    "assignment_id": assignment["id"],
+                    "content_id": content_id,
+                    "status": "skipped",
+                    "action": "no_language",
+                })
+                job["skipped"] += 1
+                continue
+
+            tasks.append(
+                process_single_sync_item(
+                    sem, job_id, assignment, content_row, language, content_type, dry_run
+                )
+            )
+
+        job["total"] = len(tasks) + job["skipped"]
+
+        # 4. Run all tasks in parallel
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for r in results:
+                if isinstance(r, Exception):
+                    job["errors"] += 1
+                    job["results"].append({
+                        "status": "error",
+                        "error": str(r)[:300],
+                    })
+                else:
+                    job["results"].append(r)
+                    if r["status"] == "updated":
+                        job["updated"] += 1
+                    elif r["status"] == "would_update":
+                        job["would_update"] += 1
+                    elif r["status"] == "skipped":
+                        job["skipped"] += 1
+                    elif r["status"] == "error":
+                        job["errors"] += 1
+
+                # Update progress for polling
+                job["processed"] += 1
+
+        job["status"] = "completed"
+        logger.info(
+            f"Sync job {job_id}: Done — "
+            f"updated={job['updated']}, would_update={job['would_update']}, "
+            f"skipped={job['skipped']}, errors={job['errors']}"
+        )
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = str(e)[:500]
+        logger.error(f"Sync job {job_id}: Fatal error — {e}")
+
+
+# ── Linear Sync: API Endpoints ─────────────────────────────────────────────
+
+@app.post("/api/linear-sync/bites")
+async def sync_bites(
+    background_tasks: BackgroundTasks,
+    dry_run: bool = True,
+    x_fix_lab_key: str = Header(...),
+):
+    """Sync completed bites assignments → Linear 'Approved' status."""
+    verify_secret(x_fix_lab_key)
+
+    job_id = str(uuid.uuid4())
+    sync_jobs[job_id] = {
+        "id": job_id,
+        "content_type": "bites",
+        "dry_run": dry_run,
+        "status": "starting",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "would_update": 0,
+        "skipped": 0,
+        "errors": 0,
+        "error": None,
+        "message": None,
+        "results": [],
+    }
+
+    background_tasks.add_task(run_linear_sync_job, job_id, "bites", dry_run)
+    logger.info(f"Sync job {job_id}: Created for bites (dry_run={dry_run})")
+
+    return {"job_id": job_id, "status": "starting", "dry_run": dry_run, "content_type": "bites"}
+
+
+@app.post("/api/linear-sync/summaries")
+async def sync_summaries(
+    background_tasks: BackgroundTasks,
+    dry_run: bool = True,
+    x_fix_lab_key: str = Header(...),
+):
+    """Sync completed summaries assignments → Linear 'Approved' status."""
+    verify_secret(x_fix_lab_key)
+
+    job_id = str(uuid.uuid4())
+    sync_jobs[job_id] = {
+        "id": job_id,
+        "content_type": "summaries",
+        "dry_run": dry_run,
+        "status": "starting",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "would_update": 0,
+        "skipped": 0,
+        "errors": 0,
+        "error": None,
+        "message": None,
+        "results": [],
+    }
+
+    background_tasks.add_task(run_linear_sync_job, job_id, "summaries", dry_run)
+    logger.info(f"Sync job {job_id}: Created for summaries (dry_run={dry_run})")
+
+    return {"job_id": job_id, "status": "starting", "dry_run": dry_run, "content_type": "summaries"}
+
+
+@app.get("/api/linear-sync/jobs/{job_id}")
+async def get_sync_job_status(job_id: str, x_fix_lab_key: str = Header(...)):
+    """Poll sync job progress."""
+    verify_secret(x_fix_lab_key)
+
+    job = sync_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Sync job not found")
+
+    response = {
+        "job_id": job["id"],
+        "content_type": job["content_type"],
+        "dry_run": job["dry_run"],
+        "status": job["status"],
+        "total": job["total"],
+        "processed": job["processed"],
+        "updated": job["updated"],
+        "would_update": job["would_update"],
+        "skipped": job["skipped"],
+        "errors": job["errors"],
+        "error": job.get("error"),
+        "message": job.get("message"),
+        "results": job["results"],
+    }
+
+    # Include summary for status check jobs
+    if "summary" in job and job["summary"]:
+        response["summary"] = job["summary"]
+
+    return response
+
+
+@app.get("/api/linear-sync/status/{content_type}")
+async def get_sync_status(
+    content_type: str,
+    background_tasks: BackgroundTasks,
+    x_fix_lab_key: str = Header(...),
+):
+    """
+    Compare RMS completed assignments vs Linear statuses.
+    Returns a job_id — poll /api/linear-sync/jobs/{job_id} for results.
+    content_type must be 'bites' or 'summaries'.
+    """
+    verify_secret(x_fix_lab_key)
+
+    if content_type not in ("bites", "summaries"):
+        raise HTTPException(status_code=400, detail="content_type must be 'bites' or 'summaries'")
+
+    job_id = str(uuid.uuid4())
+    sync_jobs[job_id] = {
+        "id": job_id,
+        "content_type": content_type,
+        "dry_run": True,
+        "status": "starting",
+        "total": 0,
+        "processed": 0,
+        "updated": 0,
+        "would_update": 0,
+        "skipped": 0,
+        "errors": 0,
+        "error": None,
+        "message": "status_check",
+        "results": [],
+        # Extra fields for status check
+        "summary": {},
+    }
+
+    background_tasks.add_task(run_status_check_job, job_id, content_type)
+    logger.info(f"Status check job {job_id}: Created for {content_type}")
+
+    return {"job_id": job_id, "status": "starting", "content_type": content_type}
+
+
+async def run_status_check_job(job_id: str, content_type: str):
+    """Background worker: compare RMS completed vs Linear statuses."""
+    job = sync_jobs[job_id]
+    job["status"] = "running"
+    logger.info(f"Status check {job_id}: Starting ({content_type})")
+
+    try:
+        # 1. Fetch completed assignments
+        assignments = await sb_get(
+            f"content_assignments?content_type=eq.{content_type}&status=eq.completed&select=id,content_id,assigned_languages"
+        )
+
+        if not assignments:
+            job["status"] = "completed"
+            job["summary"] = {"completed_in_rms": 0, "synced": 0, "not_synced": 0, "errors": 0}
+            job["message"] = "No completed assignments found"
+            return
+
+        # 2. Fetch content rows in bulk
+        content_ids = [a["content_id"] for a in assignments if a.get("content_id")]
+        table = "bites" if content_type == "bites" else "summaries"
+
+        content_map = {}
+        batch_size = 50
+        for i in range(0, len(content_ids), batch_size):
+            batch_ids = content_ids[i:i + batch_size]
+            ids_filter = ",".join(batch_ids)
+            rows = await sb_get(
+                f"{table}?id=in.({ids_filter})&select=id,linear_identifier,source_id,title"
+            )
+            for row in rows:
+                content_map[row["id"]] = row
+
+        # 3. Check each assignment's Linear status in parallel
+        sem = asyncio.Semaphore(LINEAR_SEMAPHORE_LIMIT)
+        synced = []
+        not_synced = []
+        check_errors = []
+        no_identifier = []
+
+        job["total"] = len(assignments)
+
+        async def check_one(assignment):
+            async with sem:
+                content_id = assignment.get("content_id")
+                content_row = content_map.get(content_id)
+
+                if not content_row:
+                    job["processed"] += 1
+                    return {"type": "error", "data": {
+                        "assignment_id": assignment["id"],
+                        "content_id": content_id,
+                        "reason": "content_not_found",
+                    }}
+
+                langs = assignment.get("assigned_languages", [])
+                if isinstance(langs, str):
+                    import json as _json
+                    langs = _json.loads(langs)
+                language = langs[0] if langs else None
+
+                base_id = content_row.get("linear_identifier")
+                target_id = build_linear_identifier(base_id, language, content_type) if base_id and language else None
+
+                if not target_id:
+                    job["processed"] += 1
+                    return {"type": "no_identifier", "data": {
+                        "assignment_id": assignment["id"],
+                        "content_id": content_id,
+                        "title": content_row.get("title", ""),
+                        "language": language,
+                        "base_identifier": base_id,
+                    }}
+
+                try:
+                    issue = await linear_get_issue(target_id)
+                    job["processed"] += 1
+
+                    if not issue:
+                        return {"type": "not_synced", "data": {
+                            "assignment_id": assignment["id"],
+                            "content_id": content_id,
+                            "title": content_row.get("title", ""),
+                            "linear_identifier": target_id,
+                            "language": language,
+                            "linear_status": "issue_not_found",
+                        }}
+
+                    status_name = issue.get("state", {}).get("name", "Unknown")
+
+                    item = {
+                        "assignment_id": assignment["id"],
+                        "content_id": content_id,
+                        "title": content_row.get("title", ""),
+                        "linear_identifier": target_id,
+                        "language": language,
+                        "linear_status": status_name,
+                    }
+
+                    if status_name in ("Approved", "Published"):
+                        return {"type": "synced", "data": item}
+                    else:
+                        return {"type": "not_synced", "data": item}
+
+                except Exception as e:
+                    job["processed"] += 1
+                    return {"type": "error", "data": {
+                        "assignment_id": assignment["id"],
+                        "content_id": content_id,
+                        "linear_identifier": target_id,
+                        "error": str(e)[:300],
+                    }}
+
+        results = await asyncio.gather(*[check_one(a) for a in assignments], return_exceptions=True)
+
+        for r in results:
+            if isinstance(r, Exception):
+                check_errors.append({"error": str(r)[:300]})
+            elif r["type"] == "synced":
+                synced.append(r["data"])
+            elif r["type"] == "not_synced":
+                not_synced.append(r["data"])
+            elif r["type"] == "no_identifier":
+                no_identifier.append(r["data"])
+            elif r["type"] == "error":
+                check_errors.append(r["data"])
+
+        job["summary"] = {
+            "completed_in_rms": len(assignments),
+            "synced": len(synced),
+            "not_synced": len(not_synced),
+            "no_identifier": len(no_identifier),
+            "errors": len(check_errors),
+        }
+        job["results"] = {
+            "synced": synced,
+            "not_synced": not_synced,
+            "no_identifier": no_identifier,
+            "errors": check_errors,
+        }
+        job["status"] = "completed"
+
+        logger.info(
+            f"Status check {job_id}: Done — "
+            f"RMS completed={len(assignments)}, synced={len(synced)}, "
+            f"not_synced={len(not_synced)}, no_id={len(no_identifier)}, errors={len(check_errors)}"
+        )
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["error"] = str(e)[:500]
+        logger.error(f"Status check {job_id}: Fatal error — {e}")
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
