@@ -28,7 +28,7 @@ import logging
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Header, HTTPException, BackgroundTasks, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -69,6 +69,36 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("fix-lab")
+
+# ── Per-job Log Buffer (in-memory, ephemeral) ────────────────────────────────
+# Each job gets a log list (REST endpoint) and a Queue (SSE streaming).
+# Logs are NOT persisted to Supabase — job_items handles real auditing.
+
+JOB_LOG_MAX = 500
+job_log_buffer: Dict[str, List[dict]] = {}
+job_log_queues: Dict[str, asyncio.Queue] = {}
+
+
+def job_log(job_id: str, level: str, msg: str):
+    """Write one log entry to Python logger + in-memory buffer + SSE queue."""
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "msg": msg,
+    }
+    # Still appears in Render console
+    getattr(logger, level.lower(), logger.info)(f"[{job_id[:8]}] {msg}")
+    # Buffer (for REST /logs endpoint and SSE catch-up)
+    buf = job_log_buffer.setdefault(job_id, [])
+    if len(buf) < JOB_LOG_MAX:
+        buf.append(entry)
+    # SSE queue (None-safe — queue is created when job worker starts)
+    q = job_log_queues.get(job_id)
+    if q:
+        try:
+            q.put_nowait(entry)
+        except asyncio.QueueFull:
+            pass
 
 # ── FastAPI App ─────────────────────────────────────────────────────────────
 
@@ -315,11 +345,13 @@ async def resume_interrupted_jobs():
 
 async def run_regeneration_job(job_id: str):
     """Process pending items one at a time with DB checkpointing."""
-    logger.info(f"Job {job_id}: Starting worker")
+    # Create SSE queue for this job so the frontend can stream logs live
+    job_log_queues[job_id] = asyncio.Queue(maxsize=JOB_LOG_MAX)
+    job_log(job_id, "INFO", "Starting worker")
 
     try:
         pending_items = await get_pending_items(job_id)
-        logger.info(f"Job {job_id}: {len(pending_items)} pending items to process")
+        job_log(job_id, "INFO", f"{len(pending_items)} pending items to process")
 
         for job_item in pending_items:
             bite_id = job_item["bite_id"]
@@ -339,6 +371,7 @@ async def run_regeneration_job(job_id: str):
                         "error": "Bite not found",
                     })
                     await update_job(job_id, {"failed": (await get_job(job_id))["failed"] + 1})
+                    job_log(job_id, "WARNING", f"Skipped {bite_id[:8]}/{lang} — bite not found in DB")
                     continue
 
                 bite = bites[0]
@@ -362,7 +395,7 @@ async def run_regeneration_job(job_id: str):
                         "result": json.dumps({"title": title}),
                     })
                     await update_job(job_id, {"failed": (await get_job(job_id))["failed"] + 1})
-                    logger.warning(f"Job {job_id}: Skipped {bite_id}/{lang} — no text")
+                    job_log(job_id, "WARNING", f"Skipped {bite_id[:8]}/{lang} — no text content")
                     continue
 
                 # 3. Get the voice ID
@@ -379,10 +412,7 @@ async def run_regeneration_job(job_id: str):
                     })
                     job = await get_job(job_id)
                     await update_job(job_id, {"failed": job["failed"] + 1})
-                    logger.warning(
-                        f"Job {job_id}: Skipped {bite_id}/{lang} — "
-                        f"no voice configured for '{vo_artist}'"
-                    )
+                    job_log(job_id, "WARNING", f"Skipped {bite_id[:8]}/{lang} — no voice for '{vo_artist}'")
                     continue
 
                 # 4. Determine the new round number
@@ -392,15 +422,15 @@ async def run_regeneration_job(job_id: str):
                 current_version = audio_version.get(lang, 1)
                 new_version = current_version + 1
 
-                logger.info(f"Job {job_id}: Generating {bite_id}/{lang} "
-                           f"(voice={vo_artist}, round {current_round}→{new_round})")
+                job_log(job_id, "INFO",
+                        f"Generating '{title[:40]}' [{lang.upper()}] "
+                        f"voice={vo_artist!r} round {current_round}→{new_round}")
 
                 # 5. Generate TTS audio (blocking — run in thread pool)
                 audio_bytes = await asyncio.to_thread(
                     generate_audio, text, voice_id, lang
                 )
-
-                logger.info(f"Job {job_id}: Generated {len(audio_bytes)} bytes for {bite_id}/{lang}")
+                job_log(job_id, "INFO", f"Generated {len(audio_bytes):,} bytes ({len(text)} chars)")
 
                 # 5b. Calculate audio duration using mutagen
                 duration_str = None
@@ -412,12 +442,13 @@ async def run_regeneration_job(job_id: str):
                     minutes = int(total_seconds // 60)
                     seconds = int(total_seconds % 60)
                     duration_str = f"{minutes:02d}:{seconds:02d}"
-                    logger.info(f"Job {job_id}: Audio duration: {duration_str}")
+                    job_log(job_id, "INFO", f"Audio duration: {duration_str}")
                 except Exception as e:
-                    logger.warning(f"Job {job_id}: Could not calculate duration: {e}")
+                    job_log(job_id, "WARNING", f"Could not calculate duration: {e}")
 
                 # 6. Upload to Supabase Storage
                 storage_path = build_new_audio_path(source_id, lang, new_round)
+                job_log(job_id, "INFO", f"Uploading → {storage_path}")
                 new_url = await sb_upload_storage(
                     bucket="RMS-content",
                     path=storage_path,
@@ -427,6 +458,8 @@ async def run_regeneration_job(job_id: str):
                 # Free memory immediately
                 audio_size = len(audio_bytes)
                 del audio_bytes
+
+                job_log(job_id, "INFO", f"Upload done ({audio_size // 1024} KB)")
 
                 # 6b. Two-phase checkpoint — persist upload result BEFORE touching bites table.
                 #     If the bites PATCH below fails, uploaded_url is still saved here
@@ -454,6 +487,7 @@ async def run_regeneration_job(job_id: str):
                     "audio": updated_audio,
                     "audio_version": updated_version,
                 })
+                job_log(job_id, "INFO", f"Bites table updated → v{new_version}")
 
                 # 8. Auto-mark assignment as 'fixed' — structured audit trail
                 if assignment_id:
@@ -462,18 +496,14 @@ async def run_regeneration_job(job_id: str):
                             "status": "fixed",
                         })
                         await update_job_item(item_id, {"assignment_fixed": True})
-                        logger.info(
-                            f"Job {job_id}: Marked assignment {assignment_id} as 'fixed'"
-                        )
+                        job_log(job_id, "INFO", f"Assignment {assignment_id[:8]} → fixed")
                     except Exception as e:
                         await update_job_item(item_id, {
                             "assignment_fixed": False,
                             "assignment_fix_error": str(e)[:300],
                         })
-                        logger.warning(
-                            f"Job {job_id}: Could not mark assignment {assignment_id} as fixed — {e}. "
-                            f"Recorded in job_item.assignment_fix_error for manual recovery."
-                        )
+                        job_log(job_id, "WARNING",
+                                f"Assignment {assignment_id[:8]} fix failed: {str(e)[:80]}")
 
                 # 9. Update job item as completed
                 result_data = {
@@ -494,7 +524,9 @@ async def run_regeneration_job(job_id: str):
                 job = await get_job(job_id)
                 await update_job(job_id, {"completed": job["completed"] + 1})
 
-                logger.info(f"Job {job_id}: ✅ {bite_id}/{lang} → round{new_round}, v{new_version}, {duration_str}")
+                job_log(job_id, "INFO",
+                        f"✅ {bite_id[:8]}/{lang} → round{new_round} v{new_version} "
+                        f"{duration_str or '?'} {audio_size // 1024}KB")
 
             except Exception as e:
                 await update_job_item(item_id, {
@@ -503,13 +535,13 @@ async def run_regeneration_job(job_id: str):
                 })
                 job = await get_job(job_id)
                 await update_job(job_id, {"failed": job["failed"] + 1})
-                logger.error(f"Job {job_id}: ❌ {bite_id}/{lang} — {e}")
+                job_log(job_id, "ERROR", f"❌ {bite_id}/{lang} — {str(e)[:120]}")
 
-            # Breathe on 0.1 CPU — longer delay between items
+            # Breathe on CPU — longer delay between items
             await asyncio.sleep(2)
 
     except Exception as e:
-        logger.error(f"Job {job_id}: Fatal error — {e}")
+        job_log(job_id, "ERROR", f"Fatal error — {e}")
 
     # Mark job as complete
     job = await get_job(job_id)
@@ -521,13 +553,23 @@ async def run_regeneration_job(job_id: str):
         else:
             final_status = "completed"
         await update_job(job_id, {"status": final_status})
-        logger.info(f"Job {job_id}: Done — {job['completed']}/{job['total']} succeeded, "
-                   f"{job['failed']} failed")
+        job_log(job_id, "INFO",
+                f"Done — {job['completed']}/{job['total']} succeeded, {job['failed']} failed")
 
+    # Signal SSE stream to stop (put done sentinel in queue)
+    q = job_log_queues.get(job_id)
+    if q:
+        try:
+            q.put_nowait({"type": "done"})
+        except asyncio.QueueFull:
+            pass
 
 # ═══════════════════════════════════════════════════════════════════════════
 # API ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+
 
 @app.get("/")
 async def health():
@@ -566,7 +608,7 @@ async def start_regeneration(
     # Run in background
     background_tasks.add_task(run_regeneration_job, job_id)
 
-    logger.info(f"Job {job_id}: Created with {total_items} items")
+    job_log(job_id, "INFO", f"Job created with {total_items} items — queued for processing")
     return {"job_id": job_id, "status": "running", "total": total_items}
 
 
@@ -613,6 +655,72 @@ async def get_job_status(job_id: str, x_fix_lab_key: str = Header(...)):
         "failed": job["failed"],
         "results": results,
     }
+
+
+# ── Job Log Endpoints ──────────────────────────────────────────────────────
+
+@app.get("/api/fix-lab/jobs/{job_id}/logs")
+async def get_job_logs(job_id: str, x_fix_lab_key: str = Header(...)):
+    """Return the full in-memory log buffer for a job (REST, for catch-up / completed jobs)."""
+    verify_secret(x_fix_lab_key)
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid job ID format")
+    logs = job_log_buffer.get(job_id, [])
+    return {"job_id": job_id, "logs": logs, "count": len(logs)}
+
+
+@app.get("/api/fix-lab/jobs/{job_id}/logs/stream")
+async def stream_job_logs(job_id: str, x_fix_lab_key: str = Header(...)):
+    """
+    SSE endpoint: streams log entries for a running job as they are emitted.
+    Connect using fetch() + ReadableStream (NOT native EventSource) so that
+    the x-fix-lab-key header can be passed. Each event is:
+        data: {"ts":"...","level":"INFO","msg":"..."}\n\n
+    A final event:
+        data: {"type":"done"}\n\n
+    signals that the job has finished and the stream may be closed.
+    """
+    verify_secret(x_fix_lab_key)
+    try:
+        uuid.UUID(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid job ID format")
+
+    async def event_generator():
+        # 1. Send all buffered entries first (catch-up for late-connecting clients)
+        for entry in list(job_log_buffer.get(job_id, [])):
+            yield f"data: {json.dumps(entry)}\n\n"
+
+        # 2. If no live queue exists, job hasn't started or is already done
+        q = job_log_queues.get(job_id)
+        if q is None:
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+            return
+
+        # 3. Stream new entries until the worker puts the done sentinel
+        while True:
+            try:
+                entry = await asyncio.wait_for(q.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                # Heartbeat comment — keeps Render's reverse proxy alive
+                yield ": ping\n\n"
+                continue
+
+            yield f"data: {json.dumps(entry)}\n\n"
+
+            if entry.get("type") == "done":
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # Disable Nginx buffering on Render
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
