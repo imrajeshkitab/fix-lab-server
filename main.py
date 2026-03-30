@@ -50,6 +50,11 @@ FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET", "kitab-fix-lab-2024")
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 PORT = int(os.getenv("PORT", "8642"))
 
+# Storage Supabase — may point to a different project than the DB.
+# Falls back to the main DB creds if not explicitly set.
+STORAGE_SUPABASE_URL = os.getenv("STORAGE_SUPABASE_URL") or SUPABASE_URL
+STORAGE_SUPABASE_SERVICE_KEY = os.getenv("STORAGE_SUPABASE_SERVICE_KEY") or SUPABASE_SERVICE_KEY
+
 # Supabase REST headers (service role bypasses RLS)
 SB_HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY,
@@ -175,12 +180,16 @@ async def sb_insert_many(table: str, rows: list) -> Any:
 
 
 async def sb_upload_storage(bucket: str, path: str, data: bytes, content_type: str = "audio/mpeg") -> str:
-    """Upload a file to Supabase Storage and return its public URL."""
+    """Upload a file to Supabase Storage and return its public URL.
+
+    Uses STORAGE_SUPABASE_URL / STORAGE_SUPABASE_SERVICE_KEY so the storage
+    bucket can live on a different Supabase project than the DB tables.
+    """
     r = await http_client.post(
-        f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}",
+        f"{STORAGE_SUPABASE_URL}/storage/v1/object/{bucket}/{path}",
         headers={
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "apikey": STORAGE_SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {STORAGE_SUPABASE_SERVICE_KEY}",
             "Content-Type": content_type,
             "x-upsert": "true",
         },
@@ -190,7 +199,8 @@ async def sb_upload_storage(bucket: str, path: str, data: bytes, content_type: s
         logger.error(f"Storage upload failed: {r.status_code} {r.text[:300]}")
         raise Exception(f"Storage upload failed: {r.status_code}")
 
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
+    # Public URL is constructed from the STORAGE project's URL (not the DB project)
+    public_url = f"{STORAGE_SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
     return public_url
 
 
