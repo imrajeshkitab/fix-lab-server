@@ -50,6 +50,11 @@ FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET", "kitab-fix-lab-2024")
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 PORT = int(os.getenv("PORT", "8642"))
 
+# Storage Supabase — may point to a different project than the DB.
+# Falls back to the main DB creds if not explicitly set.
+STORAGE_SUPABASE_URL = os.getenv("STORAGE_SUPABASE_URL") or SUPABASE_URL
+STORAGE_SUPABASE_SERVICE_KEY = os.getenv("STORAGE_SUPABASE_SERVICE_KEY") or SUPABASE_SERVICE_KEY
+
 # Supabase REST headers (service role bypasses RLS)
 SB_HEADERS = {
     "apikey": SUPABASE_SERVICE_KEY,
@@ -175,12 +180,16 @@ async def sb_insert_many(table: str, rows: list) -> Any:
 
 
 async def sb_upload_storage(bucket: str, path: str, data: bytes, content_type: str = "audio/mpeg") -> str:
-    """Upload a file to Supabase Storage and return its public URL."""
+    """Upload a file to Supabase Storage and return its public URL.
+
+    Uses STORAGE_SUPABASE_URL / STORAGE_SUPABASE_SERVICE_KEY so the storage
+    bucket can live on a different Supabase project than the DB tables.
+    """
     r = await http_client.post(
-        f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}",
+        f"{STORAGE_SUPABASE_URL}/storage/v1/object/{bucket}/{path}",
         headers={
-            "apikey": SUPABASE_SERVICE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "apikey": STORAGE_SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {STORAGE_SUPABASE_SERVICE_KEY}",
             "Content-Type": content_type,
             "x-upsert": "true",
         },
@@ -190,7 +199,8 @@ async def sb_upload_storage(bucket: str, path: str, data: bytes, content_type: s
         logger.error(f"Storage upload failed: {r.status_code} {r.text[:300]}")
         raise Exception(f"Storage upload failed: {r.status_code}")
 
-    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
+    # Public URL is constructed from the STORAGE project's URL (not the DB project)
+    public_url = f"{STORAGE_SUPABASE_URL}/storage/v1/object/public/{bucket}/{path}"
     return public_url
 
 
@@ -360,6 +370,21 @@ async def run_regeneration_job(job_id: str):
                 vo_artist = lang_audio.get("vo_artist", "")
                 voice_id = get_voice_id(vo_artist, lang)
 
+                # Guard: skip item if no voice is configured for this artist
+                if voice_id is None:
+                    await update_job_item(item_id, {
+                        "status": "skipped",
+                        "error": f"No voice configured for vo_artist '{vo_artist}' / lang '{lang}'. "
+                                 f"Add it to voice_config.py to enable regeneration.",
+                    })
+                    job = await get_job(job_id)
+                    await update_job(job_id, {"failed": job["failed"] + 1})
+                    logger.warning(
+                        f"Job {job_id}: Skipped {bite_id}/{lang} — "
+                        f"no voice configured for '{vo_artist}'"
+                    )
+                    continue
+
                 # 4. Determine the new round number
                 current_url = lang_audio.get("url", "")
                 current_round = parse_audio_round(current_url)
@@ -403,6 +428,17 @@ async def run_regeneration_job(job_id: str):
                 audio_size = len(audio_bytes)
                 del audio_bytes
 
+                # 6b. Two-phase checkpoint — persist upload result BEFORE touching bites table.
+                #     If the bites PATCH below fails, uploaded_url is still saved here
+                #     so the item is auditable / manually recoverable.
+                await update_job_item(item_id, {
+                    "uploaded_url": new_url,
+                    "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    "from_version": current_version,
+                    "new_round": new_round,
+                    "new_version": new_version,
+                })
+
                 # 7. Update the bites table
                 updated_audio = dict(audio_data)
                 lang_audio_updated = dict(lang_audio)
@@ -419,15 +455,25 @@ async def run_regeneration_job(job_id: str):
                     "audio_version": updated_version,
                 })
 
-                # 8. Auto-mark assignment as 'fixed'
+                # 8. Auto-mark assignment as 'fixed' — structured audit trail
                 if assignment_id:
                     try:
                         await sb_patch("content_assignments", assignment_id, {
                             "status": "fixed",
                         })
-                        logger.info(f"Job {job_id}: Marked assignment {assignment_id} as 'fixed'")
+                        await update_job_item(item_id, {"assignment_fixed": True})
+                        logger.info(
+                            f"Job {job_id}: Marked assignment {assignment_id} as 'fixed'"
+                        )
                     except Exception as e:
-                        logger.warning(f"Job {job_id}: Could not mark assignment as fixed: {e}")
+                        await update_job_item(item_id, {
+                            "assignment_fixed": False,
+                            "assignment_fix_error": str(e)[:300],
+                        })
+                        logger.warning(
+                            f"Job {job_id}: Could not mark assignment {assignment_id} as fixed — {e}. "
+                            f"Recorded in job_item.assignment_fix_error for manual recovery."
+                        )
 
                 # 9. Update job item as completed
                 result_data = {
