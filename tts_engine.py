@@ -12,8 +12,8 @@ import logging
 
 logger = logging.getLogger("fix-lab.tts")
 
-# Path to TTS scripts
-TTS_DIR = os.path.join(os.path.dirname(__file__), "..", "TTS-scripts")
+# TTS scripts live in the same directory as this file (colocated for Render deployment)
+TTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Import modules with dots in filenames ───────────────────────────────────
 
