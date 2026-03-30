@@ -370,6 +370,21 @@ async def run_regeneration_job(job_id: str):
                 vo_artist = lang_audio.get("vo_artist", "")
                 voice_id = get_voice_id(vo_artist, lang)
 
+                # Guard: skip item if no voice is configured for this artist
+                if voice_id is None:
+                    await update_job_item(item_id, {
+                        "status": "skipped",
+                        "error": f"No voice configured for vo_artist '{vo_artist}' / lang '{lang}'. "
+                                 f"Add it to voice_config.py to enable regeneration.",
+                    })
+                    job = await get_job(job_id)
+                    await update_job(job_id, {"failed": job["failed"] + 1})
+                    logger.warning(
+                        f"Job {job_id}: Skipped {bite_id}/{lang} — "
+                        f"no voice configured for '{vo_artist}'"
+                    )
+                    continue
+
                 # 4. Determine the new round number
                 current_url = lang_audio.get("url", "")
                 current_round = parse_audio_round(current_url)
@@ -413,6 +428,17 @@ async def run_regeneration_job(job_id: str):
                 audio_size = len(audio_bytes)
                 del audio_bytes
 
+                # 6b. Two-phase checkpoint — persist upload result BEFORE touching bites table.
+                #     If the bites PATCH below fails, uploaded_url is still saved here
+                #     so the item is auditable / manually recoverable.
+                await update_job_item(item_id, {
+                    "uploaded_url": new_url,
+                    "uploaded_at": datetime.now(timezone.utc).isoformat(),
+                    "from_version": current_version,
+                    "new_round": new_round,
+                    "new_version": new_version,
+                })
+
                 # 7. Update the bites table
                 updated_audio = dict(audio_data)
                 lang_audio_updated = dict(lang_audio)
@@ -429,15 +455,25 @@ async def run_regeneration_job(job_id: str):
                     "audio_version": updated_version,
                 })
 
-                # 8. Auto-mark assignment as 'fixed'
+                # 8. Auto-mark assignment as 'fixed' — structured audit trail
                 if assignment_id:
                     try:
                         await sb_patch("content_assignments", assignment_id, {
                             "status": "fixed",
                         })
-                        logger.info(f"Job {job_id}: Marked assignment {assignment_id} as 'fixed'")
+                        await update_job_item(item_id, {"assignment_fixed": True})
+                        logger.info(
+                            f"Job {job_id}: Marked assignment {assignment_id} as 'fixed'"
+                        )
                     except Exception as e:
-                        logger.warning(f"Job {job_id}: Could not mark assignment as fixed: {e}")
+                        await update_job_item(item_id, {
+                            "assignment_fixed": False,
+                            "assignment_fix_error": str(e)[:300],
+                        })
+                        logger.warning(
+                            f"Job {job_id}: Could not mark assignment {assignment_id} as fixed — {e}. "
+                            f"Recorded in job_item.assignment_fix_error for manual recovery."
+                        )
 
                 # 9. Update job item as completed
                 result_data = {
