@@ -2,12 +2,16 @@
 Fix Lab Backend Server
 ======================
 FastAPI server that handles audio regeneration for the Fix Lab feature,
-and RMS → Linear status sync.
+RMS → Linear status sync, and AI-powered VO triage.
 
 Endpoints:
   GET  /                                    — Health check
   POST /api/fix-lab/regenerate              — Start audio regeneration for selected items
   GET  /api/fix-lab/jobs/{job_id}           — Poll job progress
+  POST /api/fix-lab/triage                  — Run AI triage on a bite (Phase 1)
+  GET  /api/fix-lab/triage/{triage_id}      — Get stored triage result
+  GET  /api/fix-lab/triage                  — List triage results (with filters)
+  PATCH /api/fix-lab/triage/{triage_id}     — Admin approve/reject triage
   POST /api/linear-sync/bites              — Sync completed bites → Linear Approved
   POST /api/linear-sync/summaries          — Sync completed summaries → Linear Approved
   GET  /api/linear-sync/status/{type}      — Compare RMS vs Linear statuses
@@ -17,7 +21,14 @@ Auth: x-fix-lab-key header must match FIX_LAB_SECRET env var.
 
 Job state is persisted in Supabase tables (fix_lab_jobs, fix_lab_job_items)
 so jobs survive server restarts and Render cold-starts.
+
+AI Triage (Phase 1) uses a hybrid pipeline:
+  1. Local Whisper STT for paragraph-level timestamp alignment
+  2. Code logic to map timestamped feedback → paragraphs
+  3. Gemini text-only call for decision making (no audio sent to LLM)
+Results are stored in bite_audio_triage table for admin review.
 """
+
 
 import os
 import uuid
@@ -43,11 +54,12 @@ from voice_config import get_voice_id
 
 # ── Settings ────────────────────────────────────────────────────────────────
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/").removesuffix("/rest/v1")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET", "kitab-fix-lab-2024")
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 PORT = int(os.getenv("PORT", "8642"))
 
 # Storage Supabase — may point to a different project than the DB.
@@ -72,7 +84,7 @@ logger = logging.getLogger("fix-lab")
 
 # ── FastAPI App ─────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Fix Lab Server", version="2.0.0")
+app = FastAPI(title="Fix Lab Server", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,6 +128,15 @@ class RegenerateRequest(BaseModel):
     items: List[RegenerateItem]  # [{bite_id, language, assignment_id}, ...]
 
 
+class TriageRequest(BaseModel):
+    assignment_id: str
+
+
+class TriageAdminAction(BaseModel):
+    admin_action: str           # approved, rejected, modified
+    admin_notes: Optional[str] = None
+
+
 # ── Auth Dependency ─────────────────────────────────────────────────────────
 
 def verify_secret(x_fix_lab_key: str = Header(...)):
@@ -128,10 +149,23 @@ def verify_secret(x_fix_lab_key: str = Header(...)):
 
 async def sb_get(path: str, params: dict = None) -> Any:
     """GET request to Supabase REST API."""
+    # Split embedded query params from path (e.g., "table?id=eq.x&select=y")
+    if "?" in path:
+        table_path, query_string = path.split("?", 1)
+        from urllib.parse import parse_qs
+        parsed = parse_qs(query_string, keep_blank_values=True)
+        # parse_qs returns lists; flatten single values
+        url_params = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
+        # Merge: explicit params override URL params
+        merged_params = {**url_params, **(params or {})}
+    else:
+        table_path = path
+        merged_params = params or {}
+
     r = await http_client.get(
-        f"{SUPABASE_URL}/rest/v1/{path}",
+        f"{SUPABASE_URL}/rest/v1/{table_path}",
         headers=SB_HEADERS,
-        params=params or {},
+        params=merged_params,
     )
     if r.status_code not in (200, 206):
         logger.error(f"Supabase GET {path} failed: {r.status_code} {r.text[:300]}")
@@ -176,6 +210,32 @@ async def sb_insert_many(table: str, rows: list) -> Any:
     if r.status_code not in (200, 201):
         logger.error(f"Supabase INSERT MANY {table} failed: {r.status_code} {r.text[:300]}")
         raise Exception(f"Supabase insert error: {r.status_code}")
+    return r.json()
+
+
+async def sb_patch_where(table: str, filter_query: str, data: dict) -> Any:
+    """PATCH multiple rows by a filter query string (e.g. 'bite_id=eq.X&status=eq.completed')."""
+    r = await http_client.patch(
+        f"{SUPABASE_URL}/rest/v1/{table}?{filter_query}",
+        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+        json=data,
+    )
+    if r.status_code not in (200, 204):
+        logger.error(f"Supabase PATCH WHERE {table} failed: {r.status_code} {r.text[:300]}")
+        raise Exception(f"Supabase update error: {r.status_code}")
+    return True
+
+
+async def sb_rpc(function_name: str, params: dict) -> Any:
+    """Call a Supabase RPC function via REST API."""
+    r = await http_client.post(
+        f"{SUPABASE_URL}/rest/v1/rpc/{function_name}",
+        headers=SB_HEADERS,
+        json=params,
+    )
+    if r.status_code != 200:
+        logger.error(f"RPC {function_name} failed: {r.status_code} {r.text[:300]}")
+        raise Exception(f"RPC error: {r.status_code}")
     return r.json()
 
 
@@ -495,7 +555,13 @@ async def run_regeneration_job(job_id: str):
 
 @app.get("/")
 async def health():
-    return {"status": "ok", "service": "fix-lab-server", "version": "2.0.0"}
+    triage_ready = bool(GEMINI_API_KEY)
+    return {
+        "status": "ok",
+        "service": "fix-lab-server",
+        "version": "2.1.0",
+        "triage_enabled": triage_ready,
+    }
 
 
 @app.post("/api/fix-lab/regenerate")
@@ -1183,6 +1249,396 @@ async def run_status_check_job(job_id: str, content_type: str):
         job["status"] = "failed"
         job["error"] = str(e)[:500]
         logger.error(f"Status check {job_id}: Fatal error — {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VO TRIAGE — AI-powered audio issue analysis (Phase 1)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Phase 1 is READ-ONLY: analyzes audio + feedback, returns a fix plan.
+# No audio is regenerated — the admin reviews the plan in FixLab UI.
+#
+# Endpoints:
+#   POST /api/fix-lab/triage             — Run triage on a bite
+#   GET  /api/fix-lab/triage/{triage_id} — Get stored triage result
+#   GET  /api/fix-lab/triage             — List triage results (with filters)
+#   PATCH /api/fix-lab/triage/{triage_id} — Admin approve/reject/modify
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@app.post("/api/fix-lab/triage")
+async def triage_bite(
+    request: TriageRequest,
+    x_fix_lab_key: str = Header(...),
+):
+    """
+    Run AI triage on a bite's voice-over audio.
+
+    Only input needed: assignment_id from content_assignments.
+    The endpoint validates the assignment (must be content_type=bites,
+    status=changes_requested) and derives bite_id + language automatically.
+
+    Pipeline:
+      1. Validate assignment
+      2. Fetch bite data + download audio + fetch feedback
+      3. Local Whisper STT → paragraph-level timestamps
+      4. Code logic → map timestamped feedback to paragraphs
+      5. Gemini text-only → decision (only affected paras + full feedback thread)
+      6. Persist + return
+
+    Requires GEMINI_API_KEY or GOOGLE_API_KEY in environment.
+    """
+    verify_secret(x_fix_lab_key)
+
+    from triage import split_into_paragraphs, run_triage_decision
+    from stt import transcribe_audio, align_paragraphs, map_feedback_to_paragraphs
+
+    assignment_id = request.assignment_id
+
+    # ── 1. Fetch and validate the assignment ───────────────────────────────
+    logger.info(f"DEBUG: SUPABASE_URL = {SUPABASE_URL}")
+    query_path = (
+        f"content_assignments?id=eq.{assignment_id}"
+        f"&select=id,content_id,content_type,status,assigned_languages"
+    )
+    logger.info(f"DEBUG: Full URL = {SUPABASE_URL}/rest/v1/{query_path}")
+    assignments = await sb_get(query_path)
+    logger.info(f"DEBUG: assignments response = {assignments}")
+    if not assignments:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    assignment = assignments[0]
+    logger.info(f"DEBUG: assignment[0] = {assignment}")
+
+    # Validate content_type
+    if assignment.get("content_type") != "bites":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Triage is only supported for bites, "
+                   f"but this assignment is content_type='{assignment.get('content_type')}'"
+        )
+
+    # Validate status
+    if assignment.get("status") != "changes_requested":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Triage requires status='changes_requested', "
+                   f"but this assignment has status='{assignment.get('status')}'"
+        )
+
+    # Derive bite_id and language from the assignment
+    bite_id = assignment["content_id"]
+    assigned_langs = assignment.get("assigned_languages", [])
+    if isinstance(assigned_langs, str):
+        assigned_langs = json.loads(assigned_langs)
+    if not assigned_langs:
+        raise HTTPException(
+            status_code=400,
+            detail="Assignment has no assigned_languages"
+        )
+    lang = assigned_langs[0]
+
+    logger.info(f"Triage: assignment={assignment_id}, bite={bite_id}, lang={lang}")
+
+    # ── 2. Fetch bite data ─────────────────────────────────────────────────
+    bites = await sb_get(
+        f"bites?id=eq.{bite_id}&select=id,source_id,title,content,audio,audio_version"
+    )
+    if not bites:
+        raise HTTPException(status_code=404, detail="Bite not found")
+    bite = bites[0]
+
+    # ── 3. Extract text content ────────────────────────────────────────────
+    content_data = bite.get("content", {}) or {}
+    lang_content = content_data.get(lang, {})
+    if isinstance(lang_content, dict):
+        text = lang_content.get("text", "") or lang_content.get("body", "")
+    else:
+        text = str(lang_content) if lang_content else ""
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {lang} content text found for this bite"
+        )
+
+    paragraphs = split_into_paragraphs(text)
+    logger.info(f"Triage {bite_id}/{lang}: {len(paragraphs)} paragraphs, "
+                f"{len(text)} chars")
+
+    # ── 4. Download audio ──────────────────────────────────────────────────
+    audio_data = bite.get("audio", {}) or {}
+    lang_audio = audio_data.get(lang, {}) or {}
+    audio_url = lang_audio.get("url")
+
+    if not audio_url:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No {lang} audio URL found for this bite"
+        )
+
+    logger.info(f"Triage {bite_id}/{lang}: Downloading audio...")
+    audio_resp = await http_client.get(audio_url)
+    if audio_resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to download audio: HTTP {audio_resp.status_code}"
+        )
+    audio_bytes = audio_resp.content
+    logger.info(f"Triage {bite_id}/{lang}: Audio downloaded, {len(audio_bytes)} bytes")
+
+    # ── 5. Fetch reviewer feedback ─────────────────────────────────────────
+    feedback_items = []
+
+    # Get latest reviews for this assignment (most recent first)
+    reviews = await sb_get(
+        f"reviews?assignment_id=eq.{assignment_id}"
+        f"&select=id,rating,feedback_details,created_at"
+        f"&order=created_at.desc&limit=5"
+    )
+
+    # Extract structured feedback items, filtered by language
+    for review in reviews:
+        details = review.get("feedback_details")
+        if isinstance(details, str):
+            details = json.loads(details)
+        if details and isinstance(details, list):
+            for item in details:
+                item_lang = item.get("language")
+                # Include if language matches OR if no language tag (legacy)
+                if item_lang == lang or not item_lang:
+                    feedback_items.append(item)
+
+    logger.info(f"Triage {bite_id}/{lang}: {len(feedback_items)} feedback items")
+
+    if not feedback_items:
+        logger.warning(
+            f"Triage {bite_id}/{lang}: No feedback items found. "
+            "Model will analyze based on general context only."
+        )
+
+    # ── 6. Whisper STT → paragraph alignment ───────────────────────────────
+    logger.info(f"Triage {bite_id}/{lang}: Running Whisper STT...")
+    try:
+        segments = transcribe_audio(audio_bytes, lang)
+        paragraph_timings = align_paragraphs(segments, paragraphs)
+    except Exception as e:
+        logger.error(f"Triage {bite_id}/{lang}: STT failed: {e}")
+        # If STT fails, we can still run triage without paragraph timings
+        # All feedback becomes "unmapped" and goes to Gemini as-is
+        paragraph_timings = []
+    finally:
+        del audio_bytes  # Free memory
+
+    # ── 7. Map feedback to paragraphs (code logic, no LLM) ─────────────────
+    mapped_feedback, unmapped_feedback, affected_indices = map_feedback_to_paragraphs(
+        feedback_items, paragraph_timings
+    )
+
+    logger.info(
+        f"Triage {bite_id}/{lang}: {len(mapped_feedback)} mapped, "
+        f"{len(unmapped_feedback)} unmapped, "
+        f"{len(affected_indices)} affected paragraphs"
+    )
+
+    # ── 8. Gemini text-only decision ───────────────────────────────────────
+    try:
+        result, usage = await run_triage_decision(
+            paragraphs=paragraphs,
+            affected_indices=affected_indices,
+            mapped_feedback=mapped_feedback,
+            unmapped_feedback=unmapped_feedback,
+            language=lang,
+            title=bite.get("title", ""),
+        )
+    except Exception as e:
+        logger.error(f"Triage failed for {bite_id}/{lang}: {e}")
+
+        # Store failure for audit trail
+        try:
+            await sb_insert("bite_audio_triage", {
+                "bite_id": bite_id,
+                "language": lang,
+                "assignment_id": assignment_id,
+                "decision": "escalate",
+                "reasoning": f"Triage failed: {str(e)[:500]}",
+                "status": "failed",
+            })
+        except Exception:
+            pass  # Don't fail the request if audit insert fails
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Triage failed: {str(e)[:200]}"
+        )
+
+    # ── 9. Persist result ──────────────────────────────────────────────────
+    triage_record = await sb_insert("bite_audio_triage", {
+        "bite_id": bite_id,
+        "language": lang,
+        "assignment_id": assignment_id,
+        "decision": result.get("decision", "escalate"),
+        "confidence": result.get("confidence"),
+        "segments_to_regen": result.get("segments_to_regen", []),
+        "feedback_classification": result.get("feedback_classification", []),
+        "paragraph_timings": paragraph_timings,
+        "reasoning": result.get("reasoning", ""),
+        "model_used": usage.get("model", ""),
+        "cost_input_tokens": usage.get("input_tokens", 0),
+        "cost_output_tokens": usage.get("output_tokens", 0),
+        "status": "completed",
+    })
+
+    # ── 9b. Expire previous triage runs for the same (bite, language) ──────
+    # Mark older rows as expired so admin queue only shows the latest.
+    # Only expire NON-expired rows other than the one we just inserted.
+    try:
+        await sb_patch_where(
+            "bite_audio_triage",
+            f"bite_id=eq.{bite_id}"
+            f"&language=eq.{lang}"
+            f"&id=neq.{triage_record['id']}"
+            f"&status=neq.expired",
+            {"status": "expired"},
+        )
+    except Exception as e:
+        # Don't fail the request — the new row is already saved.
+        logger.warning(f"Triage {bite_id}/{lang}: Could not expire old rows: {e}")
+
+    # ── 10. Return ─────────────────────────────────────────────────────────
+    logger.info(
+        f"Triage {bite_id}/{lang}: Done — decision={result.get('decision')}, "
+        f"triage_id={triage_record['id']}"
+    )
+
+    return {
+        "triage_id": triage_record["id"],
+        "assignment_id": assignment_id,
+        "bite_id": bite_id,
+        "language": lang,
+        "title": bite.get("title", ""),
+        "decision": result.get("decision"),
+        "confidence": result.get("confidence"),
+        "reasoning": result.get("reasoning"),
+        "segments_to_regen": result.get("segments_to_regen", []),
+        "feedback_classification": result.get("feedback_classification", []),
+        "paragraph_timings": paragraph_timings,
+        "paragraphs_count": len(paragraphs),
+        "feedback_count": len(feedback_items),
+        "mapped_feedback_count": len(mapped_feedback),
+        "affected_paragraphs": sorted(affected_indices),
+        "tokens": usage,
+    }
+
+
+@app.get("/api/fix-lab/triage/{triage_id}")
+async def get_triage_result(triage_id: str, x_fix_lab_key: str = Header(...)):
+    """Get a stored triage result by ID."""
+    verify_secret(x_fix_lab_key)
+
+    try:
+        uuid.UUID(triage_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid triage ID format")
+
+    rows = await sb_get(f"bite_audio_triage?id=eq.{triage_id}&select=*")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Triage result not found")
+
+    row = rows[0]
+    # Parse JSONB fields in case they come as strings
+    for field in ("segments_to_regen", "feedback_classification", "paragraph_timings"):
+        if isinstance(row.get(field), str):
+            row[field] = json.loads(row[field])
+
+    return row
+
+
+@app.get("/api/fix-lab/triage")
+async def list_triage_results(
+    bite_id: Optional[str] = None,
+    language: Optional[str] = None,
+    assignment_id: Optional[str] = None,
+    decision: Optional[str] = None,
+    pending_review: bool = False,
+    limit: int = 20,
+    x_fix_lab_key: str = Header(...),
+):
+    """
+    List triage results with optional filters.
+
+    Query params:
+      - bite_id: filter by bite
+      - language: filter by language
+      - assignment_id: filter by assignment
+      - decision: filter by decision type
+      - pending_review: if true, only show results without admin_action
+      - limit: max results (default 20, max 100)
+    """
+    verify_secret(x_fix_lab_key)
+
+    query = "bite_audio_triage?select=*&order=created_at.desc"
+    if bite_id:
+        query += f"&bite_id=eq.{bite_id}"
+    if language:
+        query += f"&language=eq.{language}"
+    if assignment_id:
+        query += f"&assignment_id=eq.{assignment_id}"
+    if decision:
+        query += f"&decision=eq.{decision}"
+    if pending_review:
+        query += "&admin_action=is.null&status=eq.completed"
+    query += f"&limit={min(limit, 100)}"
+
+    rows = await sb_get(query)
+
+    for row in rows:
+        for field in ("segments_to_regen", "feedback_classification", "paragraph_timings"):
+            if isinstance(row.get(field), str):
+                row[field] = json.loads(row[field])
+
+    return {"results": rows, "count": len(rows)}
+
+
+@app.patch("/api/fix-lab/triage/{triage_id}")
+async def update_triage_result(
+    triage_id: str,
+    request: TriageAdminAction,
+    x_fix_lab_key: str = Header(...),
+):
+    """
+    Admin action on a triage result.
+
+    Actions:
+      - approved: AI recommendation accepted, proceed to regeneration (Phase 2+)
+      - rejected: AI recommendation rejected, no action taken
+      - modified: Admin made changes, notes describe modifications
+    """
+    verify_secret(x_fix_lab_key)
+
+    try:
+        uuid.UUID(triage_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid triage ID format")
+
+    if request.admin_action not in ("approved", "rejected", "modified"):
+        raise HTTPException(
+            status_code=400,
+            detail="admin_action must be one of: approved, rejected, modified"
+        )
+
+    await sb_patch("bite_audio_triage", triage_id, {
+        "admin_action": request.admin_action,
+        "admin_notes": request.admin_notes,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    logger.info(f"Triage {triage_id}: Admin action → {request.admin_action}")
+
+    return {
+        "triage_id": triage_id,
+        "admin_action": request.admin_action,
+        "admin_notes": request.admin_notes,
+    }
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
