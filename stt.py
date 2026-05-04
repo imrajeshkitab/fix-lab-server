@@ -9,15 +9,18 @@ This module is a PRE-PROCESSING step only:
   - Feedback timestamps are mapped to paragraphs using simple range checks
 
 Functions:
-  transcribe_audio()          — Run Whisper, get segment-level timestamps (EN path)
-  align_paragraphs()          — Char-similarity alignment (EN path, works fine)
-  transcribe_audio_words()    — Run Whisper with word_timestamps=True (HI path)
-  align_paragraphs_hi()       — Word-anchor alignment for Hindi
-  map_feedback_to_paragraphs() — Map feedback items to paragraphs by timestamp
+  transcribe_audio_words()          — Run Whisper with word_timestamps=True
+  align_paragraphs_word_anchor()    — Word-anchor alignment (all languages)
+  map_feedback_to_paragraphs()      — Map feedback items to paragraphs by timestamp
 
-Language dispatch:
-  - EN → transcribe_audio + align_paragraphs (original logic, unchanged)
-  - HI → transcribe_audio_words + align_paragraphs_hi (word-anchor approach)
+All languages use the same pipeline:
+  1. Whisper with word_timestamps=True → per-word ms-level timing
+  2. Word-anchor matching → find paragraph start times
+  3. Interpolation fallback for unmatched paragraphs
+
+Legacy (kept but unused):
+  transcribe_audio()    — Segment-level Whisper (no word timestamps)
+  align_paragraphs()    — Char-similarity alignment (segment-level, ~7s precision)
 """
 
 import json
@@ -460,13 +463,14 @@ def _find_anchor_index(
     return None
 
 
-def align_paragraphs_hi(
+def align_paragraphs_word_anchor(
     words: List[dict],
     source_paragraphs: List[str],
     audio_duration: float,
+    language: str = "en",
 ) -> List[dict]:
     """
-    Word-anchor based paragraph alignment for Hindi.
+    Word-anchor based paragraph alignment (works for any language).
 
     Strategy:
       1. For each paragraph, pick 2-3 distinctive anchor words
@@ -481,6 +485,7 @@ def align_paragraphs_hi(
         words: Whisper word-level timestamps from transcribe_audio_words()
         source_paragraphs: List of paragraph strings
         audio_duration: Total audio duration in seconds (from Whisper info)
+        language: "en" or "hi" (selects stopword list)
 
     Returns:
         [{"paragraph_index": int, "t_start": float, "t_end": float}]
@@ -493,12 +498,13 @@ def align_paragraphs_hi(
         return []
 
     # ── 1. Anchor each paragraph ──
+    stopwords = HI_STOPWORDS if language == "hi" else EN_STOPWORDS
     word_cursor = 0
     para_starts: List[Optional[float]] = []  # one per paragraph
     matched_count = 0
 
     for p_idx, para in enumerate(source_paragraphs):
-        anchor_tokens = _pick_anchor_words(para, HI_STOPWORDS, n=3)
+        anchor_tokens = _pick_anchor_words(para, stopwords, n=3)
         if not anchor_tokens:
             para_starts.append(None)
             continue
@@ -562,8 +568,8 @@ def align_paragraphs_hi(
         })
 
     logger.info(
-        f"STT (HI): Aligned {len(timings)} paragraphs "
-        f"({matched_count} anchored, {len(timings) - matched_count} interpolated)"
+        f"STT: Aligned {len(timings)} paragraphs "
+        f"({matched_count} anchored, {len(timings) - matched_count} interpolated, lang={language})"
     )
 
     return timings

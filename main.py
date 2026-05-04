@@ -1771,8 +1771,7 @@ async def triage_bite(
 
     from triage import split_into_paragraphs, run_triage_decision
     from stt import (
-        transcribe_audio, align_paragraphs,
-        transcribe_audio_words, align_paragraphs_hi,
+        transcribe_audio_words, align_paragraphs_word_anchor,
         map_feedback_to_paragraphs,
     )
 
@@ -1900,17 +1899,14 @@ async def triage_bite(
         )
 
     # ── 6. Whisper STT → paragraph alignment ───────────────────────────────
-    # Dispatch by language:
-    #   EN → segment-level Whisper + char-similarity (works well)
-    #   HI → word-level Whisper + word-anchor (Devanagari-friendly)
-    logger.info(f"Triage {bite_id}/{lang}: Running Whisper STT...")
+    # Unified path: word-level Whisper + word-anchor alignment for all languages
+    # This gives ms-level precision instead of segment-level (~7s chunks)
+    logger.info(f"Triage {bite_id}/{lang}: Running Whisper STT (word-level)...")
     try:
-        if lang == "hi":
-            words, audio_duration = transcribe_audio_words(audio_bytes, lang)
-            paragraph_timings = align_paragraphs_hi(words, paragraphs, audio_duration)
-        else:
-            segments = transcribe_audio(audio_bytes, lang)
-            paragraph_timings = align_paragraphs(segments, paragraphs)
+        words, audio_duration = transcribe_audio_words(audio_bytes, lang)
+        paragraph_timings = align_paragraphs_word_anchor(
+            words, paragraphs, audio_duration, language=lang
+        )
     except Exception as e:
         logger.error(f"Triage {bite_id}/{lang}: STT failed: {e}")
         # If STT fails, we can still run triage without paragraph timings
