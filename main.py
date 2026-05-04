@@ -37,7 +37,7 @@ import asyncio
 import json
 import re
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
@@ -386,6 +386,237 @@ async def _load_triage_for_item(triage_id: Optional[str]) -> Optional[dict]:
     return rows[0] if rows else None
 
 
+# ── Phase 1 / Phase 2 helpers (segment regen + splice) ─────────────────────
+
+async def _ensure_segment_audio(
+    triage: dict,
+    paragraph_index: int,
+    text: str,
+    voice_id: str,
+    language: str,
+    char_limit_label: str = "",
+) -> Tuple[dict, list]:
+    """
+    Phase 1 building block: ensure a single segment exists in audio_segments_triage/
+    and is reflected in triage.segment_audio. Idempotent — skips TTS if already done.
+
+    paragraph_index = -1 indicates the FULL audio (decision=full).
+
+    Args:
+        triage: the bite_audio_triage row (mutated locally via segment_audio list)
+        paragraph_index: 0..N-1 for partial, -1 for full
+        text: text to send to TTS
+        voice_id: ElevenLabs voice id
+        language: 'en' or 'hi'
+        char_limit_label: optional label for logging
+
+    Returns:
+        (segment_entry_dict, full_segment_audio_list_after_update)
+    """
+    from audio_pipeline import segment_storage_path, audio_duration_sec
+    triage_id = triage["id"]
+    existing = list(triage.get("segment_audio") or [])
+
+    # Idempotent: if we already have this paragraph_index, return it
+    for s in existing:
+        if s.get("paragraph_index") == paragraph_index and s.get("url"):
+            logger.info(
+                f"Triage {triage_id}: segment p{paragraph_index} already exists "
+                f"({s['url']}), skipping TTS"
+            )
+            return s, existing
+
+    if not text or not text.strip():
+        raise Exception(f"Empty text for paragraph_index={paragraph_index}")
+
+    logger.info(
+        f"Triage {triage_id}: TTS p{paragraph_index} "
+        f"({language}, {len(text)} chars{', ' + char_limit_label if char_limit_label else ''})"
+    )
+
+    # Run blocking TTS in a thread
+    audio_bytes = await asyncio.to_thread(generate_audio, text, voice_id, language)
+
+    # Upload to storage
+    storage_path = segment_storage_path(triage_id, paragraph_index)
+    url = await sb_upload_storage(
+        bucket="RMS-content",
+        path=storage_path,
+        data=audio_bytes,
+    )
+
+    duration_sec = audio_duration_sec(audio_bytes)
+    char_count = len(text)
+    audio_size = len(audio_bytes)
+    del audio_bytes  # free memory
+
+    entry = {
+        "paragraph_index": paragraph_index,
+        "url": url,
+        "duration_sec": round(duration_sec, 2) if duration_sec is not None else None,
+        "char_count": char_count,
+        "audio_size": audio_size,
+        "voice_id": voice_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    existing.append(entry)
+
+    # Persist incrementally so a crash mid-loop preserves what's done
+    await sb_patch("bite_audio_triage", triage_id, {"segment_audio": existing})
+    logger.info(
+        f"Triage {triage_id}: ✅ uploaded p{paragraph_index} → "
+        f"{url[-60:]} ({duration_sec or '?'}s, {audio_size} bytes)"
+    )
+
+    return entry, existing
+
+
+async def _phase2_finalize(
+    triage: dict,
+    bite: dict,
+    lang: str,
+    assignment_id: Optional[str],
+    segment_audio: list,
+    job_id_for_log: str,
+) -> dict:
+    """
+    Phase 2: produce the final stitched audio, upload to bites/audio/{lang}/round{N+1}/,
+    update bites.audio + audio_version, update triage.final_audio_url, mark assignment fixed.
+
+    For decision=full: just download the {triage_id}_full.mp3 segment and re-upload to round path.
+    For decision=partial: ffmpeg/pydub splice using segment_audio + triage.paragraph_timings.
+
+    Returns a result dict with: new_url, new_round, new_version, audio_size, duration.
+    """
+    from audio_pipeline import splice_audio, audio_duration_str
+    triage_id = triage["id"]
+    decision = triage.get("decision")
+    bite_id = bite["id"]
+    source_id = bite.get("source_id", bite_id)
+    audio_data = bite.get("audio", {}) or {}
+    lang_audio = audio_data.get(lang, {}) or {}
+    audio_version = bite.get("audio_version", {}) or {"en": 1, "hi": 1}
+
+    current_url = lang_audio.get("url", "")
+    current_round = parse_audio_round(current_url)
+    new_round = current_round + 1
+    new_version = (audio_version.get(lang, 1) or 1) + 1
+
+    # ── Build the final audio bytes ──
+    if decision == "full":
+        # Use the {triage_id}_full.mp3 segment directly
+        full_entry = next((s for s in segment_audio if s.get("paragraph_index") == -1), None)
+        if not full_entry or not full_entry.get("url"):
+            raise Exception("Phase 2 (full): no full segment found in segment_audio")
+
+        logger.info(f"Job {job_id_for_log}: phase2 full — fetching {full_entry['url'][-60:]}")
+        resp = await http_client.get(full_entry["url"])
+        if resp.status_code != 200:
+            raise Exception(f"Failed to fetch full segment: HTTP {resp.status_code}")
+        final_bytes = resp.content
+
+    elif decision == "partial":
+        # Splice the new para segments into the original audio
+        if not current_url:
+            raise Exception("Phase 2 (partial): bite has no current audio URL — cannot splice")
+
+        logger.info(f"Job {job_id_for_log}: phase2 partial — fetching original audio")
+        resp = await http_client.get(current_url)
+        if resp.status_code != 200:
+            raise Exception(f"Failed to fetch original audio: HTTP {resp.status_code}")
+        original_bytes = resp.content
+
+        # Fetch each replacement segment's bytes
+        new_segments = []
+        for s in segment_audio:
+            p_idx = s.get("paragraph_index")
+            if p_idx is None or p_idx < 0:
+                continue
+            url = s.get("url")
+            if not url:
+                continue
+            seg_resp = await http_client.get(url)
+            if seg_resp.status_code != 200:
+                raise Exception(f"Failed to fetch segment p{p_idx}: HTTP {seg_resp.status_code}")
+            new_segments.append({
+                "paragraph_index": p_idx,
+                "audio_bytes": seg_resp.content,
+            })
+
+        if not new_segments:
+            raise Exception("Phase 2 (partial): no segment audio entries to splice")
+
+        paragraph_timings = triage.get("paragraph_timings") or []
+        logger.info(
+            f"Job {job_id_for_log}: phase2 partial — splicing {len(new_segments)} segments "
+            f"into original ({len(original_bytes)} bytes)"
+        )
+        final_bytes = await asyncio.to_thread(
+            splice_audio, original_bytes, paragraph_timings, new_segments
+        )
+        del original_bytes
+        del new_segments
+    else:
+        raise Exception(f"Phase 2: unsupported decision '{decision}'")
+
+    # ── Upload the final audio to the round path ──
+    duration_str = audio_duration_str(final_bytes)
+    storage_path = build_new_audio_path(source_id, lang, new_round)
+    new_url = await sb_upload_storage(
+        bucket="RMS-content",
+        path=storage_path,
+        data=final_bytes,
+    )
+    audio_size = len(final_bytes)
+    del final_bytes
+
+    # ── Update bites.audio + audio_version ──
+    updated_audio = dict(audio_data)
+    lang_audio_updated = dict(lang_audio)
+    lang_audio_updated["url"] = new_url
+    if duration_str is not None:
+        lang_audio_updated["duration"] = duration_str
+    updated_audio[lang] = lang_audio_updated
+
+    updated_version = dict(audio_version)
+    updated_version[lang] = new_version
+
+    await sb_patch("bites", bite_id, {
+        "audio": updated_audio,
+        "audio_version": updated_version,
+    })
+
+    # ── Update triage with final audio info (audit trail) ──
+    try:
+        await sb_patch("bite_audio_triage", triage_id, {
+            "final_audio_url": new_url,
+            "final_audio_round": new_round,
+        })
+    except Exception as e:
+        logger.warning(f"Could not update triage final_audio fields: {e}")
+
+    # ── Mark assignment as fixed ──
+    if assignment_id:
+        try:
+            await sb_patch("content_assignments", assignment_id, {"status": "fixed"})
+            logger.info(f"Job {job_id_for_log}: marked assignment {assignment_id} as 'fixed'")
+        except Exception as e:
+            logger.warning(f"Could not mark assignment as fixed: {e}")
+
+    logger.info(
+        f"Job {job_id_for_log}: ✅ phase2 done — round{new_round}, v{new_version}, "
+        f"{duration_str}, {audio_size} bytes"
+    )
+
+    return {
+        "new_url": new_url,
+        "new_round": new_round,
+        "new_version": new_version,
+        "audio_size": audio_size,
+        "duration": duration_str,
+    }
+
+
 # ── Regeneration Job Worker ─────────────────────────────────────────────────
 
 async def run_regeneration_job(job_id: str):
@@ -396,9 +627,18 @@ async def run_regeneration_job(job_id: str):
       - If item has a triage_id, load the triage and branch by decision:
           • skip     → no audio change, mark assignment fixed, item completed
           • escalate → no audio change, no fixed mark, item skipped
-          • partial  → [Phase 2a] fall back to full regen (Phase 2b will splice)
-          • full     → run full TTS regen (default path)
-      - If item has no triage_id (direct /regenerate call) → full TTS regen.
+          • full     → Phase 1: TTS full content → upload as {triage_id}_full.mp3
+                       Phase 2: copy to round path, update bite, mark fixed
+          • partial  → Phase 1: TTS each segments_to_regen[] paragraph → upload
+                       as {triage_id}_p{N}.mp3, save URLs in segment_audio
+                       Phase 2: pydub splice using paragraph_timings, upload
+                       to round path, update bite, mark fixed
+      - If item has no triage_id (direct /regenerate call) → full TTS regen
+        (original behavior — no segment storage, single upload).
+
+    Phase 1 is idempotent: if a paragraph already has a URL in segment_audio,
+    we skip its TTS. So if Phase 2 fails, the next retry only re-runs Phase 2
+    without re-paying for TTS.
     """
     logger.info(f"Job {job_id}: Starting worker")
 
@@ -477,15 +717,6 @@ async def run_regeneration_job(job_id: str):
                     await asyncio.sleep(0.5)
                     continue
 
-                if decision == "partial":
-                    # Phase 2a: fall back to full regen with a logged warning.
-                    # Phase 2b will TTS each segment + ffmpeg-splice into existing audio.
-                    logger.warning(
-                        f"Job {job_id}: 🔧 Partial decision — falling back to FULL regen "
-                        f"for {bite_id}/{lang} (Phase 2b will splice properly)"
-                    )
-                    # fall through to the existing full TTS path below
-
                 # 2. Get the text content
                 lang_content = content_data.get(lang, {})
                 if isinstance(lang_content, dict):
@@ -508,24 +739,103 @@ async def run_regeneration_job(job_id: str):
                 vo_artist = lang_audio.get("vo_artist", "")
                 voice_id = get_voice_id(vo_artist, lang)
 
-                # 4. Determine the new round number
+                # ── Triage path (full | partial) — Phase 1 then Phase 2 ──
+                if decision in ("full", "partial"):
+                    from triage import split_into_paragraphs
+
+                    if decision == "full":
+                        # Phase 1: ensure the {triage_id}_full.mp3 exists
+                        await _ensure_segment_audio(
+                            triage=triage,
+                            paragraph_index=-1,
+                            text=text,
+                            voice_id=voice_id,
+                            language=lang,
+                            char_limit_label=f"full content",
+                        )
+                    else:
+                        # Phase 1: ensure each affected paragraph's audio exists
+                        paragraphs = split_into_paragraphs(text)
+                        if not paragraphs:
+                            raise Exception("Could not split content into paragraphs for partial regen")
+
+                        segments_to_regen = triage.get("segments_to_regen") or []
+                        if not segments_to_regen:
+                            raise Exception("Triage decision=partial but segments_to_regen is empty")
+
+                        # Sort by paragraph_index for deterministic processing order
+                        for seg_plan in sorted(
+                            segments_to_regen,
+                            key=lambda s: s.get("paragraph_index", 0)
+                        ):
+                            p_idx = seg_plan.get("paragraph_index")
+                            if p_idx is None or p_idx < 0 or p_idx >= len(paragraphs):
+                                logger.warning(
+                                    f"Job {job_id}: skipping invalid paragraph_index {p_idx} "
+                                    f"for {bite_id}/{lang}"
+                                )
+                                continue
+                            await _ensure_segment_audio(
+                                triage=triage,
+                                paragraph_index=p_idx,
+                                text=paragraphs[p_idx],
+                                voice_id=voice_id,
+                                language=lang,
+                                char_limit_label=f"P{p_idx}",
+                            )
+
+                    # Re-fetch triage to get the latest segment_audio (incremental persistence)
+                    triage = await _load_triage_for_item(triage["id"])
+                    segment_audio = triage.get("segment_audio") or []
+
+                    # Phase 2: stitch (or copy for full) and finalize
+                    finalize_result = await _phase2_finalize(
+                        triage=triage,
+                        bite=bite,
+                        lang=lang,
+                        assignment_id=assignment_id,
+                        segment_audio=segment_audio,
+                        job_id_for_log=job_id,
+                    )
+
+                    result_data = {
+                        "title": title,
+                        "decision": decision,
+                        "char_count": len(text),
+                        **finalize_result,
+                    }
+                    await update_job_item(item_id, {
+                        "status": "completed",
+                        "result": json.dumps(result_data),
+                    })
+                    job = await get_job(job_id)
+                    await update_job(job_id, {"completed": job["completed"] + 1})
+                    logger.info(
+                        f"Job {job_id}: ✅ {bite_id}/{lang} ({decision}) → "
+                        f"round{finalize_result['new_round']}, v{finalize_result['new_version']}"
+                    )
+                    await asyncio.sleep(1)
+                    continue
+
+                # ── Direct /regenerate path (no triage) — original full-text flow ──
+                # Determine new round
                 current_url = lang_audio.get("url", "")
                 current_round = parse_audio_round(current_url)
                 new_round = current_round + 1
                 current_version = audio_version.get(lang, 1)
                 new_version = current_version + 1
 
-                logger.info(f"Job {job_id}: Generating {bite_id}/{lang} "
-                           f"(voice={vo_artist}, round {current_round}→{new_round})")
+                logger.info(
+                    f"Job {job_id}: Direct full regen {bite_id}/{lang} "
+                    f"(voice={vo_artist}, round {current_round}→{new_round})"
+                )
 
-                # 5. Generate TTS audio (blocking — run in thread pool)
                 audio_bytes = await asyncio.to_thread(
                     generate_audio, text, voice_id, lang
                 )
-
                 logger.info(f"Job {job_id}: Generated {len(audio_bytes)} bytes for {bite_id}/{lang}")
 
-                # 5b. Calculate audio duration using mutagen
+                # Calculate audio duration
                 duration_str = None
                 try:
                     from io import BytesIO
@@ -535,49 +845,42 @@ async def run_regeneration_job(job_id: str):
                     minutes = int(total_seconds // 60)
                     seconds = int(total_seconds % 60)
                     duration_str = f"{minutes:02d}:{seconds:02d}"
-                    logger.info(f"Job {job_id}: Audio duration: {duration_str}")
                 except Exception as e:
                     logger.warning(f"Job {job_id}: Could not calculate duration: {e}")
 
-                # 6. Upload to Supabase Storage
+                # Upload to round path
                 storage_path = build_new_audio_path(source_id, lang, new_round)
                 new_url = await sb_upload_storage(
                     bucket="RMS-content",
                     path=storage_path,
                     data=audio_bytes,
                 )
-
-                # Free memory immediately
                 audio_size = len(audio_bytes)
                 del audio_bytes
 
-                # 7. Update the bites table
+                # Update bite
                 updated_audio = dict(audio_data)
                 lang_audio_updated = dict(lang_audio)
                 lang_audio_updated["url"] = new_url
                 if duration_str is not None:
                     lang_audio_updated["duration"] = duration_str
                 updated_audio[lang] = lang_audio_updated
-
                 updated_version = dict(audio_version)
                 updated_version[lang] = new_version
-
                 await sb_patch("bites", bite_id, {
                     "audio": updated_audio,
                     "audio_version": updated_version,
                 })
 
-                # 8. Auto-mark assignment as 'fixed'
+                # Mark assignment fixed
                 if assignment_id:
                     try:
                         await sb_patch("content_assignments", assignment_id, {
                             "status": "fixed",
                         })
-                        logger.info(f"Job {job_id}: Marked assignment {assignment_id} as 'fixed'")
                     except Exception as e:
                         logger.warning(f"Job {job_id}: Could not mark assignment as fixed: {e}")
 
-                # 9. Update job item as completed
                 result_data = {
                     "title": title,
                     "new_url": new_url,
@@ -587,19 +890,12 @@ async def run_regeneration_job(job_id: str):
                     "duration": duration_str,
                     "char_count": len(text),
                 }
-                if decision:
-                    result_data["decision"] = decision
-                    if decision == "partial":
-                        result_data["fell_back_to_full"] = True
                 await update_job_item(item_id, {
                     "status": "completed",
                     "result": json.dumps(result_data),
                 })
-
-                # Update job counters
                 job = await get_job(job_id)
                 await update_job(job_id, {"completed": job["completed"] + 1})
-
                 logger.info(f"Job {job_id}: ✅ {bite_id}/{lang} → round{new_round}, v{new_version}, {duration_str}")
 
             except Exception as e:

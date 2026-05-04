@@ -9,3 +9,4 @@ python-multipart==0.0.9
 google-genai>=1.0.0
 faster-whisper>=1.0.0
 markdown>=3.5
+pydub>=0.25.1
