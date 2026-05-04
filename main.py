@@ -6,8 +6,9 @@ RMS → Linear status sync, and AI-powered VO triage.
 
 Endpoints:
   GET  /                                    — Health check
-  POST /api/fix-lab/regenerate              — Start audio regeneration for selected items
-  GET  /api/fix-lab/jobs/{job_id}           — Poll job progress
+  POST /api/fix-lab/regenerate              — Start audio regeneration for selected items (force full)
+  POST /api/fix-lab/execute-triage          — Execute approved triage plans (Phase 2a)
+  GET  /api/fix-lab/jobs/{job_id}           — Poll job progress (works for both)
   POST /api/fix-lab/triage                  — Run AI triage on a bite (Phase 1)
   GET  /api/fix-lab/triage/{triage_id}      — Get stored triage result
   GET  /api/fix-lab/triage                  — List triage results (with filters)
@@ -135,6 +136,10 @@ class TriageRequest(BaseModel):
 class TriageAdminAction(BaseModel):
     admin_action: str           # approved, rejected, modified
     admin_notes: Optional[str] = None
+
+
+class ExecuteTriageRequest(BaseModel):
+    triage_ids: List[str]
 
 
 # ── Auth Dependency ─────────────────────────────────────────────────────────
@@ -371,10 +376,30 @@ async def resume_interrupted_jobs():
         logger.error(f"Error checking for interrupted jobs: {e}")
 
 
+# ── Triage Helper ───────────────────────────────────────────────────────────
+
+async def _load_triage_for_item(triage_id: Optional[str]) -> Optional[dict]:
+    """Fetch a bite_audio_triage row by id. Returns None if id is missing or not found."""
+    if not triage_id:
+        return None
+    rows = await sb_get(f"bite_audio_triage?id=eq.{triage_id}&select=*")
+    return rows[0] if rows else None
+
+
 # ── Regeneration Job Worker ─────────────────────────────────────────────────
 
 async def run_regeneration_job(job_id: str):
-    """Process pending items one at a time with DB checkpointing."""
+    """
+    Process pending items one at a time with DB checkpointing.
+
+    For each item:
+      - If item has a triage_id, load the triage and branch by decision:
+          • skip     → no audio change, mark assignment fixed, item completed
+          • escalate → no audio change, no fixed mark, item skipped
+          • partial  → [Phase 2a] fall back to full regen (Phase 2b will splice)
+          • full     → run full TTS regen (default path)
+      - If item has no triage_id (direct /regenerate call) → full TTS regen.
+    """
     logger.info(f"Job {job_id}: Starting worker")
 
     try:
@@ -407,6 +432,59 @@ async def run_regeneration_job(job_id: str):
                 content_data = bite.get("content", {}) or {}
                 audio_version = bite.get("audio_version", {}) or {"en": 1, "hi": 1}
                 title = bite.get("title", "Unknown")
+
+                # 1b. Triage-driven branch: skip / escalate / partial / full
+                triage = await _load_triage_for_item(job_item.get("triage_id"))
+                decision = (triage or {}).get("decision")
+
+                if decision == "skip":
+                    # No audio change — mark assignment fixed, item completed
+                    if assignment_id:
+                        try:
+                            await sb_patch("content_assignments", assignment_id, {
+                                "status": "fixed",
+                            })
+                        except Exception as e:
+                            logger.warning(f"Job {job_id}: skip path — could not mark assignment fixed: {e}")
+                    await update_job_item(item_id, {
+                        "status": "completed",
+                        "result": json.dumps({
+                            "title": title,
+                            "no_op": True,
+                            "decision": "skip",
+                            "reason": "Triage decision: skip — no actionable VO issue",
+                        }),
+                    })
+                    job = await get_job(job_id)
+                    await update_job(job_id, {"completed": job["completed"] + 1})
+                    logger.info(f"Job {job_id}: ⏭ Skipped {bite_id}/{lang} (triage=skip)")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if decision == "escalate":
+                    # No audio change, no fixed mark — needs human
+                    await update_job_item(item_id, {
+                        "status": "skipped",
+                        "error": "Triage decision: escalate — needs human intervention",
+                        "result": json.dumps({
+                            "title": title,
+                            "decision": "escalate",
+                        }),
+                    })
+                    job = await get_job(job_id)
+                    await update_job(job_id, {"failed": job["failed"] + 1})
+                    logger.info(f"Job {job_id}: ⚠️ Escalated {bite_id}/{lang} (triage=escalate)")
+                    await asyncio.sleep(0.5)
+                    continue
+
+                if decision == "partial":
+                    # Phase 2a: fall back to full regen with a logged warning.
+                    # Phase 2b will TTS each segment + ffmpeg-splice into existing audio.
+                    logger.warning(
+                        f"Job {job_id}: 🔧 Partial decision — falling back to FULL regen "
+                        f"for {bite_id}/{lang} (Phase 2b will splice properly)"
+                    )
+                    # fall through to the existing full TTS path below
 
                 # 2. Get the text content
                 lang_content = content_data.get(lang, {})
@@ -509,6 +587,10 @@ async def run_regeneration_job(job_id: str):
                     "duration": duration_str,
                     "char_count": len(text),
                 }
+                if decision:
+                    result_data["decision"] = decision
+                    if decision == "partial":
+                        result_data["fell_back_to_full"] = True
                 await update_job_item(item_id, {
                     "status": "completed",
                     "result": json.dumps(result_data),
@@ -600,6 +682,103 @@ async def start_regeneration(
     return {"job_id": job_id, "status": "running", "total": total_items}
 
 
+@app.post("/api/fix-lab/execute-triage")
+async def execute_triage(
+    request: ExecuteTriageRequest,
+    background_tasks: BackgroundTasks,
+    x_fix_lab_key: str = Header(...),
+):
+    """
+    Execute approved triage plans.
+
+    Validates each triage_id is admin_action='approved' and not expired,
+    then enqueues a regen job. The worker branches per-decision:
+      - skip:     no audio change, mark assignment 'fixed'
+      - full:     full TTS regen (single ElevenLabs call)
+      - partial:  [Phase 2a] falls back to full regen
+                  [Phase 2b] per-paragraph TTS + ffmpeg splice (TODO)
+      - escalate: skipped, needs human
+    """
+    verify_secret(x_fix_lab_key)
+
+    if not request.triage_ids:
+        raise HTTPException(status_code=400, detail="No triage_ids provided")
+
+    # Validate UUIDs
+    for tid in request.triage_ids:
+        try:
+            uuid.UUID(tid)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid triage id: {tid}")
+
+    # Single active job enforcement (shared with /regenerate)
+    active = await get_active_job()
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A job is already running (id: {active['id']}, "
+                   f"{active['completed']}/{active['total']} done). Please wait."
+        )
+
+    # Fetch all triage rows in one query
+    ids_filter = ",".join(request.triage_ids)
+    triages = await sb_get(
+        f"bite_audio_triage?id=in.({ids_filter})"
+        f"&select=id,bite_id,language,assignment_id,decision,admin_action,status"
+    )
+
+    if not triages:
+        raise HTTPException(status_code=404, detail="No triage rows found for given ids")
+
+    # Validate every triage is approved and non-expired
+    invalid = []
+    for t in triages:
+        if t.get("admin_action") != "approved":
+            invalid.append({"id": t["id"], "reason": f"admin_action={t.get('admin_action') or 'null'}"})
+        elif t.get("status") == "expired":
+            invalid.append({"id": t["id"], "reason": "status=expired"})
+
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{len(invalid)} triage(s) not eligible: {invalid[:5]}"
+        )
+
+    # Create the job
+    total_items = len(triages)
+    job = await create_job(total_items)
+    job_id = job["id"]
+
+    # Create job items, each linked to its source triage
+    job_item_rows = [
+        {
+            "job_id": job_id,
+            "bite_id": t["bite_id"],
+            "language": t["language"],
+            "assignment_id": t.get("assignment_id"),
+            "triage_id": t["id"],
+            "status": "pending",
+        }
+        for t in triages
+    ]
+    await sb_insert_many("fix_lab_job_items", job_item_rows)
+
+    # Enqueue
+    background_tasks.add_task(run_regeneration_job, job_id)
+
+    logger.info(
+        f"Job {job_id}: Created via execute-triage with {total_items} items "
+        f"(decisions: " + ", ".join(sorted({t['decision'] for t in triages})) + ")"
+    )
+
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "total": total_items,
+        "via": "triage",
+    }
+
+
 @app.get("/api/fix-lab/jobs/{job_id}")
 async def get_job_status(job_id: str, x_fix_lab_key: str = Header(...)):
     """Poll job progress. Returns job info + all item results."""
@@ -628,6 +807,10 @@ async def get_job_status(job_id: str, x_fix_lab_key: str = Header(...)):
             "status": item["status"],
             "title": result_data.get("title", ""),
             "error": item.get("error"),
+            "triage_id": item.get("triage_id"),
+            "decision": result_data.get("decision"),
+            "no_op": result_data.get("no_op", False),
+            "fell_back_to_full": result_data.get("fell_back_to_full", False),
             "new_url": result_data.get("new_url"),
             "new_round": result_data.get("new_round"),
             "new_version": result_data.get("new_version"),
