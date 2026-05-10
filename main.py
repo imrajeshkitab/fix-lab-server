@@ -2279,12 +2279,7 @@ async def get_publish_status(
         audio_version = (bite.get("audio_version") or {}).get(language, 1)
 
         prod_row = prod_map.get(source_id)
-        if not prod_row:
-            sync_status = "not_synced"
-        elif prod_row.get("published") is False:
-            sync_status = "unpublished"
-        else:
-            sync_status = "synced"
+        sync_status = "synced" if prod_row else "not_synced"
 
         items.append({
             "bite_id": bite["id"],
@@ -2302,15 +2297,14 @@ async def get_publish_status(
         })
 
     # Sort: not_synced first, then by approved_at desc
-    sync_order = {"not_synced": 0, "unpublished": 1, "synced": 2, "no_source_id": 3}
+    sync_order = {"not_synced": 0, "synced": 1, "no_source_id": 2}
     items.sort(key=lambda i: (sync_order.get(i["sync_status"], 9), i.get("approved_at") or ""), reverse=False)
 
     summary = {
         "approved": len(items),
         "synced": sum(1 for i in items if i["sync_status"] == "synced"),
         "not_synced": sum(1 for i in items if i["sync_status"] == "not_synced"),
-        "unpublished": sum(1 for i in items if i["sync_status"] == "unpublished"),
-        "errors": sum(1 for i in items if i["sync_status"] not in ("synced", "not_synced", "unpublished")),
+        "errors": sum(1 for i in items if i["sync_status"] not in ("synced", "not_synced")),
     }
 
     return {
