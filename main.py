@@ -145,6 +145,19 @@ class ExecuteTriageRequest(BaseModel):
     triage_ids: List[str]
 
 
+class PublishItem(BaseModel):
+    bite_id: str
+    language: str  # 'en' or 'hi'
+
+
+class PublishRequest(BaseModel):
+    items: List[PublishItem]
+
+
+# In-memory publish job tracking (jobs are short-lived, no need for DB persistence)
+publish_jobs: Dict[str, Dict[str, Any]] = {}
+
+
 # ── Auth Dependency ─────────────────────────────────────────────────────────
 
 def verify_secret(x_fix_lab_key: str = Header(...)):
@@ -2305,6 +2318,264 @@ async def get_publish_status(
         "summary": summary,
         "filter": {"content_type": content_type, "language": language},
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PUBLISH TO LIVE APP — Phase B (publish action)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Per item flow:
+#   1. Validate assignment (lang) is 'completed'
+#   2. Check NOT already on app prod for (source_id, language)
+#   3. Fetch RMS bite row
+#   4. Download audio from RMS audio[lang].url
+#   5. Upload to app prod 'content' bucket: bytes/audio/{source_id}.mp3 (en)
+#                                             bytes/audio_hi/{source_id}.mp3 (hi)
+#   6. Build byte row dict (mapping in publish.py)
+#   7. INSERT into app prod 'bytes' table
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _process_publish_item(item: PublishItem) -> dict:
+    """
+    Process a single publish item. Returns a result dict (no exceptions —
+    they're captured in result.error).
+    """
+    from publish import (
+        fetch_prod_byte_row, download_audio, upload_audio_to_prod,
+        insert_byte_row, build_byte_row, audio_storage_path,
+    )
+
+    bite_id = item.bite_id
+    lang = item.language
+
+    result: dict = {
+        "bite_id": bite_id,
+        "language": lang,
+        "status": "pending",
+        "title": None,
+        "source_id": None,
+        "prod_id": None,
+        "error": None,
+    }
+
+    if lang not in ("en", "hi"):
+        result["status"] = "failed"
+        result["error"] = f"Invalid language: {lang}"
+        return result
+
+    try:
+        # ── 1. Validate assignment is completed for this language ──
+        assignments = await sb_get(
+            f"content_assignments?content_id=eq.{bite_id}&content_type=eq.bites"
+            f"&select=id,status,assigned_languages"
+        )
+        matching = None
+        for a in assignments:
+            langs = a.get("assigned_languages", [])
+            if isinstance(langs, str):
+                try:
+                    langs = json.loads(langs)
+                except Exception:
+                    langs = []
+            if lang in langs:
+                matching = a
+                break
+
+        if not matching:
+            result["status"] = "skipped"
+            result["error"] = f"No {lang} assignment found"
+            return result
+        if matching.get("status") != "completed":
+            result["status"] = "skipped"
+            result["error"] = f"Assignment status is '{matching.get('status')}', not 'completed'"
+            return result
+
+        # ── 2. Fetch RMS bite ──
+        bites = await sb_get(
+            f"bites?id=eq.{bite_id}"
+            "&select=id,source_id,title,title_bilingual,author,author_bilingual,"
+            "category,source,difficulty,audio,content"
+        )
+        if not bites:
+            result["status"] = "failed"
+            result["error"] = "Bite not found in RMS"
+            return result
+        bite = bites[0]
+        source_id = bite.get("source_id")
+        if not source_id:
+            result["status"] = "failed"
+            result["error"] = "Bite has no source_id"
+            return result
+        result["source_id"] = source_id
+        result["title"] = (bite.get("title_bilingual") or {}).get(lang) or bite.get("title")
+
+        # ── 3. Check NOT already on app prod ──
+        prod_existing = await fetch_prod_byte_row(
+            http_client, APP_PROD_SUPABASE_URL, APP_PROD_SUPABASE_SERVICE_KEY,
+            source_id, lang,
+        )
+        if prod_existing:
+            result["status"] = "skipped"
+            result["error"] = f"Already on prod (id={prod_existing.get('id')})"
+            result["prod_id"] = prod_existing.get("id")
+            return result
+
+        # ── 4. Validate RMS has audio URL + content for this language ──
+        audio_obj = (bite.get("audio") or {}).get(lang) or {}
+        rms_audio_url = audio_obj.get("url")
+        if not rms_audio_url:
+            result["status"] = "failed"
+            result["error"] = f"No {lang} audio URL on RMS bite"
+            return result
+        content = (bite.get("content") or {}).get(lang)
+        if not content:
+            result["status"] = "failed"
+            result["error"] = f"No {lang} content on RMS bite"
+            return result
+
+        # ── 5. Download audio from RMS bucket ──
+        logger.info(f"Publish: downloading RMS audio for {bite_id}/{lang}")
+        audio_bytes = await download_audio(http_client, rms_audio_url)
+
+        # ── 6. Upload to app prod 'content' bucket ──
+        storage_path = audio_storage_path(source_id, lang)
+        logger.info(f"Publish: uploading to prod {storage_path} ({len(audio_bytes)} bytes)")
+        prod_audio_url = await upload_audio_to_prod(
+            http_client, APP_PROD_SUPABASE_URL, APP_PROD_SUPABASE_SERVICE_KEY,
+            storage_path, audio_bytes,
+        )
+        del audio_bytes  # free memory
+
+        # ── 7. Build + INSERT byte row ──
+        row = build_byte_row(bite, lang, APP_PROD_SUPABASE_URL)
+        # Sanity: the audio URL we just uploaded matches what build_byte_row produced
+        # (this serves as a safety check on path conventions)
+        if row["audio"] != prod_audio_url:
+            logger.warning(
+                f"Publish: audio URL mismatch — built={row['audio'][-60:]} "
+                f"uploaded={prod_audio_url[-60:]}"
+            )
+            row["audio"] = prod_audio_url  # use the actual uploaded URL
+
+        inserted = await insert_byte_row(
+            http_client, APP_PROD_SUPABASE_URL, APP_PROD_SUPABASE_SERVICE_KEY, row,
+        )
+
+        result["status"] = "succeeded"
+        result["prod_id"] = inserted.get("id")
+        result["prod_audio_url"] = prod_audio_url
+        result["prod_cover_url"] = row["cover_page"]
+        logger.info(
+            f"Publish: ✅ {bite_id}/{lang} → prod id={inserted.get('id')}"
+        )
+
+    except Exception as e:
+        logger.error(f"Publish: ❌ {bite_id}/{lang} — {e}")
+        result["status"] = "failed"
+        result["error"] = str(e)[:300]
+
+    return result
+
+
+async def run_publish_job(job_id: str, items: List[PublishItem]):
+    """Background worker: process each publish item one at a time."""
+    job = publish_jobs.get(job_id)
+    if not job:
+        logger.error(f"Publish job {job_id}: missing in memory map")
+        return
+    job["status"] = "running"
+
+    for item in items:
+        try:
+            r = await _process_publish_item(item)
+        except Exception as e:
+            r = {
+                "bite_id": item.bite_id,
+                "language": item.language,
+                "status": "failed",
+                "error": str(e)[:300],
+            }
+        job["results"].append(r)
+        job["processed"] += 1
+        s = r.get("status")
+        if s == "succeeded":
+            job["succeeded"] += 1
+        elif s == "skipped":
+            job["skipped"] += 1
+        else:
+            job["failed"] += 1
+
+        # small breathing room between items (network/storage friendly)
+        await asyncio.sleep(0.3)
+
+    job["status"] = "completed"
+    logger.info(
+        f"Publish job {job_id}: done — "
+        f"{job['succeeded']} ok, {job['skipped']} skipped, {job['failed']} failed"
+    )
+
+
+@app.post("/api/publish/bites")
+async def start_publish(
+    request: PublishRequest,
+    background_tasks: BackgroundTasks,
+    x_fix_lab_key: str = Header(...),
+):
+    """Start a publish job for a list of (bite_id, language) items."""
+    verify_secret(x_fix_lab_key)
+
+    if not request.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+    if not APP_PROD_SUPABASE_URL or not APP_PROD_SUPABASE_SERVICE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="App prod creds not configured "
+                   "(set APP_PROD_SUPABASE_URL and APP_PROD_SUPABASE_SERVICE_KEY)"
+        )
+
+    # Validate UUIDs
+    for it in request.items:
+        try:
+            uuid.UUID(it.bite_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Invalid bite_id: {it.bite_id}")
+        if it.language not in ("en", "hi"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid language for {it.bite_id}: {it.language}"
+            )
+
+    job_id = str(uuid.uuid4())
+    publish_jobs[job_id] = {
+        "id": job_id,
+        "status": "starting",
+        "total": len(request.items),
+        "processed": 0,
+        "succeeded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "results": [],
+    }
+    background_tasks.add_task(run_publish_job, job_id, request.items)
+    logger.info(f"Publish job {job_id}: created with {len(request.items)} items")
+
+    return {
+        "job_id": job_id,
+        "status": "starting",
+        "total": len(request.items),
+    }
+
+
+@app.get("/api/publish/jobs/{job_id}")
+async def get_publish_job(job_id: str, x_fix_lab_key: str = Header(...)):
+    """Poll publish job progress."""
+    verify_secret(x_fix_lab_key)
+
+    job = publish_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Publish job not found")
+    return job
 
 
 # ── Main ────────────────────────────────────────────────────────────────────

@@ -61,6 +61,85 @@ def audio_public_url(app_url: str, source_id: str, language: str) -> str:
 
 # ── App Prod DB helpers (read-only for Phase A) ───────────────────────────
 
+async def fetch_prod_byte_row(
+    http_client,
+    app_url: str,
+    app_key: str,
+    source_id: str,
+    language: str,
+) -> Optional[dict]:
+    """Fetch a single prod 'bytes' row by (source_id, language)."""
+    headers = {
+        "apikey": app_key,
+        "Authorization": f"Bearer {app_key}",
+    }
+    url = (
+        f"{app_url.rstrip('/')}/rest/v1/bytes"
+        f"?source_id=eq.{source_id}&language=eq.{language}&select=id&limit=1"
+    )
+    r = await http_client.get(url, headers=headers)
+    if r.status_code != 200:
+        raise Exception(f"App prod fetch failed: HTTP {r.status_code}")
+    rows = r.json()
+    return rows[0] if rows else None
+
+
+async def download_audio(http_client, audio_url: str) -> bytes:
+    """Download the RMS audio bytes."""
+    r = await http_client.get(audio_url)
+    if r.status_code != 200:
+        raise Exception(f"Download audio failed: HTTP {r.status_code} {audio_url[:80]}")
+    return r.content
+
+
+async def upload_audio_to_prod(
+    http_client,
+    app_url: str,
+    app_key: str,
+    storage_path: str,
+    audio_bytes: bytes,
+) -> str:
+    """
+    Upload audio bytes to app prod's `content` bucket at `storage_path`.
+    Returns the public URL.
+    """
+    headers = {
+        "apikey": app_key,
+        "Authorization": f"Bearer {app_key}",
+        "Content-Type": "audio/mpeg",
+        "x-upsert": "true",
+    }
+    url = f"{app_url.rstrip('/')}/storage/v1/object/{APP_PROD_BUCKET}/{storage_path}"
+    r = await http_client.post(url, headers=headers, content=audio_bytes)
+    if r.status_code not in (200, 201):
+        raise Exception(f"Upload audio failed: HTTP {r.status_code} {r.text[:200]}")
+    return (
+        f"{app_url.rstrip('/')}/storage/v1/object/public/"
+        f"{APP_PROD_BUCKET}/{storage_path}"
+    )
+
+
+async def insert_byte_row(
+    http_client,
+    app_url: str,
+    app_key: str,
+    row: dict,
+) -> dict:
+    """INSERT a row into app prod 'bytes' table. Returns the inserted row."""
+    headers = {
+        "apikey": app_key,
+        "Authorization": f"Bearer {app_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    url = f"{app_url.rstrip('/')}/rest/v1/bytes"
+    r = await http_client.post(url, headers=headers, json=row)
+    if r.status_code not in (200, 201):
+        raise Exception(f"Insert byte failed: HTTP {r.status_code} {r.text[:300]}")
+    result = r.json()
+    return result[0] if isinstance(result, list) and result else result
+
+
 async def fetch_prod_bytes_by_source_ids(
     http_client,
     app_url: str,
