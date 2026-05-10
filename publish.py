@@ -160,7 +160,9 @@ async def fetch_prod_bytes_by_source_ids(
     }
 
     result: Dict[str, dict] = {}
-    batch_size = 50
+    # 200 UUIDs ≈ 7.5KB in URL — well under PostgREST/HTTP limits.
+    # Bumped from 50 → 200 to cut roundtrips on large lists.
+    batch_size = 200
     for i in range(0, len(source_ids), batch_size):
         batch = source_ids[i:i + batch_size]
         ids_filter = ",".join(batch)

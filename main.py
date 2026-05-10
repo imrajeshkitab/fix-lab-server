@@ -2195,52 +2195,25 @@ async def get_publish_status(
 
     from publish import fetch_prod_bytes_by_source_ids
 
-    # ── 1. Get all assignments completed for this content_type ──
-    assignments = await sb_get(
-        "content_assignments?"
-        f"content_type=eq.{content_type}&status=eq.completed"
-        "&select=id,content_id,assigned_languages,updated_at"
-    )
+    # ── 1. RMS side: single RPC joins assignments + bites in Postgres ──
+    try:
+        rpc_rows = await sb_rpc("get_publishable_bites", {"p_language": language})
+    except Exception as e:
+        logger.error(f"Publish status: RPC failed: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"RMS RPC failed: {str(e)[:200]}"
+        )
 
-    # Filter to those whose assigned_languages contains the requested language
-    completed_for_lang = []
-    for a in assignments:
-        langs = a.get("assigned_languages", [])
-        if isinstance(langs, str):
-            try:
-                langs = json.loads(langs)
-            except Exception:
-                langs = []
-        if language in langs:
-            completed_for_lang.append(a)
-
-    if not completed_for_lang:
+    if not rpc_rows:
         return {
             "items": [],
-            "summary": {"approved": 0, "synced": 0, "not_synced": 0,
-                        "unpublished": 0, "errors": 0},
+            "summary": {"approved": 0, "synced": 0, "not_synced": 0, "errors": 0},
             "filter": {"content_type": content_type, "language": language},
         }
 
-    # ── 2. Bulk fetch the corresponding bites ──
-    content_ids = [a["content_id"] for a in completed_for_lang]
-    bites_map = {}
-    batch_size = 50
-    for i in range(0, len(content_ids), batch_size):
-        batch = content_ids[i:i + batch_size]
-        ids_filter = ",".join(batch)
-        rows = await sb_get(
-            f"bites?id=in.({ids_filter})"
-            "&select=id,source_id,title,title_bilingual,category,audio,audio_version,linear_identifier"
-        )
-        for row in rows:
-            bites_map[row["id"]] = row
-
-    # ── 3. Bulk fetch existing prod bytes rows by source_id ──
-    source_ids = [
-        b["source_id"] for b in bites_map.values()
-        if b.get("source_id")
-    ]
+    # ── 2. App prod side: bulk fetch existing rows by source_id ──
+    source_ids = [r["source_id"] for r in rpc_rows if r.get("source_id")]
     try:
         prod_map = await fetch_prod_bytes_by_source_ids(
             http_client,
@@ -2256,41 +2229,33 @@ async def get_publish_status(
             detail=f"App prod query failed: {str(e)[:200]}"
         )
 
-    # ── 4. Build the result list ──
+    # ── 3. Build the result list ──
     items = []
-    for assignment in completed_for_lang:
-        bite = bites_map.get(assignment["content_id"])
-        if not bite:
-            continue
-
-        source_id = bite.get("source_id")
+    for row in rpc_rows:
+        source_id = row.get("source_id")
         if not source_id:
             items.append({
-                "bite_id": bite["id"],
+                "bite_id": row["bite_id"],
                 "language": language,
-                "title": bite.get("title", ""),
+                "title": row.get("title", ""),
                 "sync_status": "no_source_id",
-                "approved_at": assignment.get("updated_at"),
+                "approved_at": row.get("approved_at"),
             })
             continue
-
-        title_bilingual = bite.get("title_bilingual") or {}
-        title = title_bilingual.get(language) or bite.get("title") or ""
-        audio_version = (bite.get("audio_version") or {}).get(language, 1)
 
         prod_row = prod_map.get(source_id)
         sync_status = "synced" if prod_row else "not_synced"
 
         items.append({
-            "bite_id": bite["id"],
+            "bite_id": row["bite_id"],
             "source_id": source_id,
             "language": language,
-            "title": title,
-            "category": bite.get("category"),
-            "audio_version": audio_version,
-            "linear_identifier": bite.get("linear_identifier"),
-            "approved_at": assignment.get("updated_at"),
-            "assignment_id": assignment["id"],
+            "title": row.get("title") or "",
+            "category": row.get("category"),
+            "audio_version": row.get("audio_version") or 1,
+            "linear_identifier": row.get("linear_identifier"),
+            "approved_at": row.get("approved_at"),
+            "assignment_id": row["assignment_id"],
             "sync_status": sync_status,
             "prod_id": prod_row.get("id") if prod_row else None,
             "prod_updated_at": prod_row.get("updated_at") if prod_row else None,
