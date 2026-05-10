@@ -17,6 +17,7 @@ Endpoints:
   POST /api/linear-sync/summaries          — Sync completed summaries → Linear Approved
   GET  /api/linear-sync/status/{type}      — Compare RMS vs Linear statuses
   GET  /api/linear-sync/jobs/{job_id}      — Poll sync job progress
+  GET  /api/publish/status                 — Compare RMS approved vs app prod (Phase A)
 
 Auth: x-fix-lab-key header must match FIX_LAB_SECRET env var.
 
@@ -61,6 +62,8 @@ ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET", "kitab-fix-lab-2024")
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+APP_PROD_SUPABASE_URL = os.getenv("APP_PROD_SUPABASE_URL")
+APP_PROD_SUPABASE_SERVICE_KEY = os.getenv("APP_PROD_SUPABASE_SERVICE_KEY")
 PORT = int(os.getenv("PORT", "8642"))
 
 # Storage Supabase — may point to a different project than the DB.
@@ -2124,6 +2127,183 @@ async def update_triage_result(
         "triage_id": triage_id,
         "admin_action": request.admin_action,
         "admin_notes": request.admin_notes,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PUBLISH TO LIVE APP — Phase A (read-only status)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Compares RMS approved bites (per-language assignment.status='completed')
+# against the app prod 'bytes' table to flag what's synced vs not synced.
+#
+# Phase A endpoints:
+#   GET /api/publish/status    — read-only diff
+#
+# Phase B will add:
+#   POST /api/publish/bites    — copy audio + INSERT row
+#   GET  /api/publish/jobs/... — poll publish job
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@app.get("/api/publish/status")
+async def get_publish_status(
+    content_type: str = "bites",
+    language: str = "en",
+    x_fix_lab_key: str = Header(...),
+):
+    """
+    Compute per-bite sync state for items approved (per-language) on RMS.
+
+    Returns the list of approved-for-this-language bites along with their
+    current state on app prod:
+
+      not_synced     → no row on prod for (source_id, language)
+      synced         → row exists on prod, published=true
+      unpublished    → row exists on prod, published=false (soft-hidden)
+      no_source_id   → bite has no source_id (data error)
+
+    Query params:
+      content_type=bites   (only 'bites' supported in Phase A)
+      language=en|hi
+    """
+    verify_secret(x_fix_lab_key)
+
+    if content_type != "bites":
+        raise HTTPException(status_code=400, detail="Only 'bites' supported in Phase A")
+    if language not in ("en", "hi"):
+        raise HTTPException(status_code=400, detail="language must be 'en' or 'hi'")
+    if not APP_PROD_SUPABASE_URL or not APP_PROD_SUPABASE_SERVICE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="App prod creds not configured "
+                   "(set APP_PROD_SUPABASE_URL and APP_PROD_SUPABASE_SERVICE_KEY)"
+        )
+
+    from publish import fetch_prod_bytes_by_source_ids
+
+    # ── 1. Get all assignments completed for this content_type ──
+    assignments = await sb_get(
+        "content_assignments?"
+        f"content_type=eq.{content_type}&status=eq.completed"
+        "&select=id,content_id,assigned_languages,updated_at"
+    )
+
+    # Filter to those whose assigned_languages contains the requested language
+    completed_for_lang = []
+    for a in assignments:
+        langs = a.get("assigned_languages", [])
+        if isinstance(langs, str):
+            try:
+                langs = json.loads(langs)
+            except Exception:
+                langs = []
+        if language in langs:
+            completed_for_lang.append(a)
+
+    if not completed_for_lang:
+        return {
+            "items": [],
+            "summary": {"approved": 0, "synced": 0, "not_synced": 0,
+                        "unpublished": 0, "errors": 0},
+            "filter": {"content_type": content_type, "language": language},
+        }
+
+    # ── 2. Bulk fetch the corresponding bites ──
+    content_ids = [a["content_id"] for a in completed_for_lang]
+    bites_map = {}
+    batch_size = 50
+    for i in range(0, len(content_ids), batch_size):
+        batch = content_ids[i:i + batch_size]
+        ids_filter = ",".join(batch)
+        rows = await sb_get(
+            f"bites?id=in.({ids_filter})"
+            "&select=id,source_id,title,title_bilingual,category,audio,audio_version,linear_identifier"
+        )
+        for row in rows:
+            bites_map[row["id"]] = row
+
+    # ── 3. Bulk fetch existing prod bytes rows by source_id ──
+    source_ids = [
+        b["source_id"] for b in bites_map.values()
+        if b.get("source_id")
+    ]
+    try:
+        prod_map = await fetch_prod_bytes_by_source_ids(
+            http_client,
+            APP_PROD_SUPABASE_URL,
+            APP_PROD_SUPABASE_SERVICE_KEY,
+            source_ids,
+            language,
+        )
+    except Exception as e:
+        logger.error(f"Publish status: could not fetch prod rows: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"App prod query failed: {str(e)[:200]}"
+        )
+
+    # ── 4. Build the result list ──
+    items = []
+    for assignment in completed_for_lang:
+        bite = bites_map.get(assignment["content_id"])
+        if not bite:
+            continue
+
+        source_id = bite.get("source_id")
+        if not source_id:
+            items.append({
+                "bite_id": bite["id"],
+                "language": language,
+                "title": bite.get("title", ""),
+                "sync_status": "no_source_id",
+                "approved_at": assignment.get("updated_at"),
+            })
+            continue
+
+        title_bilingual = bite.get("title_bilingual") or {}
+        title = title_bilingual.get(language) or bite.get("title") or ""
+        audio_version = (bite.get("audio_version") or {}).get(language, 1)
+
+        prod_row = prod_map.get(source_id)
+        if not prod_row:
+            sync_status = "not_synced"
+        elif prod_row.get("published") is False:
+            sync_status = "unpublished"
+        else:
+            sync_status = "synced"
+
+        items.append({
+            "bite_id": bite["id"],
+            "source_id": source_id,
+            "language": language,
+            "title": title,
+            "category": bite.get("category"),
+            "audio_version": audio_version,
+            "linear_identifier": bite.get("linear_identifier"),
+            "approved_at": assignment.get("updated_at"),
+            "assignment_id": assignment["id"],
+            "sync_status": sync_status,
+            "prod_id": prod_row.get("id") if prod_row else None,
+            "prod_updated_at": prod_row.get("updated_at") if prod_row else None,
+        })
+
+    # Sort: not_synced first, then by approved_at desc
+    sync_order = {"not_synced": 0, "unpublished": 1, "synced": 2, "no_source_id": 3}
+    items.sort(key=lambda i: (sync_order.get(i["sync_status"], 9), i.get("approved_at") or ""), reverse=False)
+
+    summary = {
+        "approved": len(items),
+        "synced": sum(1 for i in items if i["sync_status"] == "synced"),
+        "not_synced": sum(1 for i in items if i["sync_status"] == "not_synced"),
+        "unpublished": sum(1 for i in items if i["sync_status"] == "unpublished"),
+        "errors": sum(1 for i in items if i["sync_status"] not in ("synced", "not_synced", "unpublished")),
+    }
+
+    return {
+        "items": items,
+        "summary": summary,
+        "filter": {"content_type": content_type, "language": language},
     }
 
 
