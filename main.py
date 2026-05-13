@@ -59,7 +59,8 @@ from voice_config import get_voice_id
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/").removesuffix("/rest/v1")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
-FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET", "kitab-fix-lab-2024")
+FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET")
+LIVE_PUBLISH_SECRET = os.getenv("LIVE_PUBLISH_SECRET")  # required for /api/publish/*
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 APP_PROD_SUPABASE_URL = os.getenv("APP_PROD_SUPABASE_URL")
@@ -163,6 +164,19 @@ publish_jobs: Dict[str, Dict[str, Any]] = {}
 def verify_secret(x_fix_lab_key: str = Header(...)):
     if x_fix_lab_key != FIX_LAB_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Fix Lab key")
+    return True
+
+
+def verify_publish_secret(x_publish_key: str = Header(...)):
+    """Separate auth for /api/publish/* endpoints. Live-prod writes warrant a
+    different key from fix-lab ops."""
+    if not LIVE_PUBLISH_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Live Publish not configured: set LIVE_PUBLISH_SECRET env var"
+        )
+    if x_publish_key != LIVE_PUBLISH_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid Live Publish key")
     return True
 
 
@@ -2163,7 +2177,7 @@ async def update_triage_result(
 async def get_publish_status(
     content_type: str = "bites",
     language: str = "en",
-    x_fix_lab_key: str = Header(...),
+    x_publish_key: str = Header(...),
 ):
     """
     Compute per-bite sync state for items approved (per-language) on RMS.
@@ -2179,8 +2193,10 @@ async def get_publish_status(
     Query params:
       content_type=bites   (only 'bites' supported in Phase A)
       language=en|hi
+
+    Auth: x-publish-key header must match LIVE_PUBLISH_SECRET env var.
     """
-    verify_secret(x_fix_lab_key)
+    verify_publish_secret(x_publish_key)
 
     if content_type != "bites":
         raise HTTPException(status_code=400, detail="Only 'bites' supported in Phase A")
@@ -2479,10 +2495,13 @@ async def run_publish_job(job_id: str, items: List[PublishItem]):
 async def start_publish(
     request: PublishRequest,
     background_tasks: BackgroundTasks,
-    x_fix_lab_key: str = Header(...),
+    x_publish_key: str = Header(...),
 ):
-    """Start a publish job for a list of (bite_id, language) items."""
-    verify_secret(x_fix_lab_key)
+    """Start a publish job for a list of (bite_id, language) items.
+
+    Auth: x-publish-key header must match LIVE_PUBLISH_SECRET env var.
+    """
+    verify_publish_secret(x_publish_key)
 
     if not request.items:
         raise HTTPException(status_code=400, detail="No items provided")
@@ -2527,9 +2546,12 @@ async def start_publish(
 
 
 @app.get("/api/publish/jobs/{job_id}")
-async def get_publish_job(job_id: str, x_fix_lab_key: str = Header(...)):
-    """Poll publish job progress."""
-    verify_secret(x_fix_lab_key)
+async def get_publish_job(job_id: str, x_publish_key: str = Header(...)):
+    """Poll publish job progress.
+
+    Auth: x-publish-key header must match LIVE_PUBLISH_SECRET env var.
+    """
+    verify_publish_secret(x_publish_key)
 
     job = publish_jobs.get(job_id)
     if not job:
