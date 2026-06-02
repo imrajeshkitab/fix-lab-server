@@ -2,12 +2,14 @@
 Daily Reviewer Progress Report
 ================================
 Builds the report payload via Supabase RPC, renders an HTML email,
-sends via Gmail SMTP. Idempotent — safe to re-run manually.
+sends via Resend HTTPS API (Render free tier blocks outbound SMTP,
+so we use a transactional service over port 443). Idempotent —
+safe to re-run manually.
 
 Public functions:
     build_report_payload(sb_rpc_fn) -> dict
     render_html(payload) -> str
-    send_email(to_addresses, subject, html_body) -> None
+    send_email(http_client, to_addresses, subject, html_body) -> None
 
 Used by main.py endpoints:
     POST /api/reports/run-daily       — triggered by Supabase pg_cron at 10am IST
@@ -17,20 +19,19 @@ Used by main.py endpoints:
 import html as html_lib
 import logging
 import os
-from email.message import EmailMessage
-from typing import Callable, List, Optional
+from typing import List
 
 logger = logging.getLogger("fix-lab.reports")
 
 
 # ────────────────────────────── Env / config ─────────────────────────────────
+# Resend (HTTPS, port 443 — works on Render free tier)
 
-SMTP_HOST          = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT          = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER          = os.getenv("SMTP_USER")
-SMTP_APP_PASSWORD  = os.getenv("SMTP_APP_PASSWORD")
-REPORTS_FROM_NAME  = os.getenv("REPORTS_FROM_NAME", "Kitab RMS Bot")
-REPORTS_TIMEZONE   = os.getenv("REPORTS_TIMEZONE", "Asia/Kolkata")
+RESEND_API_KEY      = os.getenv("RESEND_API_KEY")
+REPORTS_FROM_EMAIL  = os.getenv("REPORTS_FROM_EMAIL", "onboarding@resend.dev")
+REPORTS_FROM_NAME   = os.getenv("REPORTS_FROM_NAME", "Kitab RMS Bot")
+REPORTS_TIMEZONE    = os.getenv("REPORTS_TIMEZONE", "Asia/Kolkata")
+RESEND_API_URL      = "https://api.resend.com/emails"
 
 
 # ─────────────────────────── Payload construction ────────────────────────────
@@ -327,49 +328,60 @@ def render_html(payload: dict) -> str:
 # ──────────────────────────── Email sending ──────────────────────────────────
 
 async def send_email(
+    http_client,
     to_addresses: List[str],
     subject: str,
     html_body: str,
 ) -> None:
     """
-    Send via Gmail SMTP using aiosmtplib. Raises on failure so the worker can
-    record it in report_runs.error.
+    Send via Resend HTTPS API. Raises on failure so the worker can record
+    it in report_runs.error.
+
+    NOTE on sender restrictions (Resend free tier):
+      - If REPORTS_FROM_EMAIL is 'onboarding@resend.dev' (the default), Resend
+        only delivers to the Resend account owner's verified email — anti-spam.
+        Verify your own domain at https://resend.com/domains to send to any
+        address.
+      - Once a domain is verified (e.g. kitab.com), set
+        REPORTS_FROM_EMAIL=rajesh.kumar@kitab.com (or similar).
     """
     if not to_addresses:
         raise RuntimeError("send_email called with empty recipient list")
-    if not SMTP_USER or not SMTP_APP_PASSWORD:
-        raise RuntimeError(
-            "SMTP not configured — set SMTP_USER and SMTP_APP_PASSWORD in .env"
-        )
+    if not RESEND_API_KEY:
+        raise RuntimeError("RESEND_API_KEY not set — configure in .env / Render env vars")
 
-    import aiosmtplib
+    # Build "From" — Resend supports "Name <email>" RFC 5322 format
+    from_field = f"{REPORTS_FROM_NAME} <{REPORTS_FROM_EMAIL}>"
 
-    msg = EmailMessage()
-    msg["From"] = f"{REPORTS_FROM_NAME} <{SMTP_USER}>"
-    msg["To"] = ", ".join(to_addresses)
-    msg["Subject"] = subject
-    # Plain-text fallback (most clients won't show this, but it's required for spam filters)
-    msg.set_content(
-        "This is the daily Kitab progress report. Your email client is showing the plain-text fallback; "
-        "open in an HTML-capable client (Gmail, Outlook, Apple Mail) to see the full report."
-    )
-    msg.add_alternative(html_body, subtype="html")
+    payload = {
+        "from":    from_field,
+        "to":      to_addresses,
+        "subject": subject,
+        "html":    html_body,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type":  "application/json",
+    }
 
     logger.info(
-        f"Reports: sending to {len(to_addresses)} recipient(s) via {SMTP_HOST}:{SMTP_PORT}"
+        f"Reports: POST to Resend for {len(to_addresses)} recipient(s) "
+        f"from <{REPORTS_FROM_EMAIL}>"
     )
 
-    await aiosmtplib.send(
-        msg,
-        hostname=SMTP_HOST,
-        port=SMTP_PORT,
-        username=SMTP_USER,
-        password=SMTP_APP_PASSWORD,
-        start_tls=True,                  # Gmail requires STARTTLS on port 587
-        timeout=30,
-    )
+    r = await http_client.post(RESEND_API_URL, headers=headers, json=payload, timeout=30)
+    if r.status_code not in (200, 201, 202):
+        # Surface the response body so report_runs.error is actionable
+        body = (r.text or "")[:500]
+        raise RuntimeError(f"Resend API HTTP {r.status_code}: {body}")
 
-    logger.info(f"Reports: email sent ✅ to {len(to_addresses)} recipient(s)")
+    # Resend returns { "id": "..." } on success
+    result = r.json() if r.content else {}
+    logger.info(
+        f"Reports: email sent ✅ to {len(to_addresses)} recipient(s) "
+        f"(resend_id={result.get('id', '?')})"
+    )
 
 
 def report_subject(payload: dict) -> str:

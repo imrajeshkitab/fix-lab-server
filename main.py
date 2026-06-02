@@ -2657,8 +2657,8 @@ async def _execute_daily_report(run_id: str):
         if not to_addresses:
             raise RuntimeError("No enabled recipients in report_recipients table")
 
-        # 4. Send
-        await send_email(to_addresses, subject, html_body)
+        # 4. Send via Resend HTTPS API (Render free tier blocks SMTP)
+        await send_email(http_client, to_addresses, subject, html_body)
 
         # 5. Mark success
         await sb_patch("report_runs", run_id, {
