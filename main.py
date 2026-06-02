@@ -270,8 +270,11 @@ async def sb_rpc(function_name: str, params: dict) -> Any:
         json=params,
     )
     if r.status_code != 200:
-        logger.error(f"RPC {function_name} failed: {r.status_code} {r.text[:300]}")
-        raise Exception(f"RPC error: {r.status_code}")
+        # Include PG error body so callers (e.g. report_runs.error) record
+        # something actionable, not just "RPC error: 400"
+        body = r.text[:500] if r.text else ""
+        logger.error(f"RPC {function_name} failed: {r.status_code} {body}")
+        raise Exception(f"RPC {function_name} → HTTP {r.status_code}: {body}")
     return r.json()
 
 
