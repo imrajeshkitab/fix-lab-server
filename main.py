@@ -61,6 +61,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET")
 REPORTS_WEBHOOK_SECRET = os.getenv("REPORTS_WEBHOOK_SECRET")  # used by pg_cron → /api/reports/run-daily
+REPORTS_ADMIN_SECRET   = os.getenv("REPORTS_ADMIN_SECRET")    # used by admin UI for everything else
 LIVE_PUBLISH_SECRET = os.getenv("LIVE_PUBLISH_SECRET")  # required for /api/publish/*
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -2602,6 +2603,20 @@ def verify_reports_secret(x_reports_secret: str = Header(...)):
     return True
 
 
+def verify_reports_admin_secret(x_reports_admin_key: str = Header(...)):
+    """Auth for admin Reports UI — separate from Fix Lab and Live Publish keys.
+    Used by: preview, recipients CRUD, runs history, manual send-now / send-test.
+    The cron webhook keeps its own REPORTS_WEBHOOK_SECRET; this is for humans."""
+    if not REPORTS_ADMIN_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Reports admin key not configured: set REPORTS_ADMIN_SECRET env var"
+        )
+    if x_reports_admin_key != REPORTS_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid Reports admin key")
+    return True
+
+
 @app.post("/api/reports/run-daily")
 async def run_daily_report(
     background_tasks: BackgroundTasks,
@@ -2634,8 +2649,14 @@ async def run_daily_report(
     }
 
 
-async def _execute_daily_report(run_id: str):
-    """Background worker — builds payload, sends email, updates run row."""
+async def _execute_daily_report(run_id: str, test_to: Optional[str] = None):
+    """
+    Background worker — builds payload, sends email, updates run row.
+
+    If `test_to` is supplied, sends ONLY to that one address (admin test mode)
+    and bypasses the report_recipients table. The Subject line gets a
+    "[TEST]" prefix in that mode.
+    """
     from reports import (
         build_report_payload, render_html, send_email,
         report_subject, headline_summary,
@@ -2650,12 +2671,18 @@ async def _execute_daily_report(run_id: str):
         # 2. Render HTML + subject
         html_body = render_html(payload)
         subject   = report_subject(payload)
+        if test_to:
+            subject = f"[TEST] {subject}"
 
-        # 3. Load enabled recipients
-        rows = await sb_get("report_recipients?enabled=eq.true&select=email,name")
-        to_addresses = [r["email"] for r in rows if r.get("email")]
-        if not to_addresses:
-            raise RuntimeError("No enabled recipients in report_recipients table")
+        # 3. Determine recipients
+        if test_to:
+            to_addresses = [test_to]
+            logger.info(f"Reports[{run_id}]: TEST mode — sending only to {test_to}")
+        else:
+            rows = await sb_get("report_recipients?enabled=eq.true&select=email,name")
+            to_addresses = [r["email"] for r in rows if r.get("email")]
+            if not to_addresses:
+                raise RuntimeError("No enabled recipients in report_recipients table")
 
         # 4. Send via Resend HTTPS API (Render free tier blocks SMTP)
         await send_email(http_client, to_addresses, subject, html_body)
@@ -2681,12 +2708,12 @@ async def _execute_daily_report(run_id: str):
 
 
 @app.get("/api/reports/preview")
-async def preview_daily_report(x_fix_lab_key: str = Header(...)):
+async def preview_daily_report(x_reports_admin_key: str = Header(...)):
     """
     Render the report HTML WITHOUT sending. Used by admin Reports tab
-    preview. Auth via x-fix-lab-key (admin key, same as Fix Lab).
+    preview. Auth via x-reports-admin-key.
     """
-    verify_secret(x_fix_lab_key)
+    verify_reports_admin_secret(x_reports_admin_key)
     from reports import build_report_payload, render_html, report_subject
 
     payload  = await build_report_payload(sb_rpc)
@@ -2701,9 +2728,9 @@ async def preview_daily_report(x_fix_lab_key: str = Header(...)):
 
 
 @app.get("/api/reports/recipients")
-async def list_recipients(x_fix_lab_key: str = Header(...)):
+async def list_recipients(x_reports_admin_key: str = Header(...)):
     """List all report recipients (enabled and disabled)."""
-    verify_secret(x_fix_lab_key)
+    verify_reports_admin_secret(x_reports_admin_key)
     rows = await sb_get("report_recipients?select=*&order=created_at.desc")
     return {"recipients": rows or []}
 
@@ -2711,10 +2738,10 @@ async def list_recipients(x_fix_lab_key: str = Header(...)):
 @app.post("/api/reports/recipients")
 async def create_recipient(
     request: RecipientCreate,
-    x_fix_lab_key: str = Header(...),
+    x_reports_admin_key: str = Header(...),
 ):
     """Add a recipient. UNIQUE constraint on email prevents duplicates."""
-    verify_secret(x_fix_lab_key)
+    verify_reports_admin_secret(x_reports_admin_key)
     if not request.email or "@" not in request.email:
         raise HTTPException(status_code=400, detail="Invalid email address")
     try:
@@ -2738,10 +2765,10 @@ async def create_recipient(
 async def update_recipient(
     recipient_id: str,
     request: RecipientUpdate,
-    x_fix_lab_key: str = Header(...),
+    x_reports_admin_key: str = Header(...),
 ):
     """Toggle enabled or update name. Email is immutable (remove + add to change)."""
-    verify_secret(x_fix_lab_key)
+    verify_reports_admin_secret(x_reports_admin_key)
     try:
         uuid.UUID(recipient_id)
     except ValueError:
@@ -2758,9 +2785,9 @@ async def update_recipient(
 
 
 @app.delete("/api/reports/recipients/{recipient_id}")
-async def delete_recipient(recipient_id: str, x_fix_lab_key: str = Header(...)):
+async def delete_recipient(recipient_id: str, x_reports_admin_key: str = Header(...)):
     """Remove a recipient entirely."""
-    verify_secret(x_fix_lab_key)
+    verify_reports_admin_secret(x_reports_admin_key)
     try:
         uuid.UUID(recipient_id)
     except ValueError:
@@ -2778,15 +2805,55 @@ async def delete_recipient(recipient_id: str, x_fix_lab_key: str = Header(...)):
 @app.get("/api/reports/runs")
 async def list_runs(
     limit: int = 20,
-    x_fix_lab_key: str = Header(...),
+    x_reports_admin_key: str = Header(...),
 ):
     """Last N report runs for the admin history view."""
-    verify_secret(x_fix_lab_key)
+    verify_reports_admin_secret(x_reports_admin_key)
     limit = min(max(limit, 1), 100)
     rows = await sb_get(
         f"report_runs?select=*&order=created_at.desc&limit={limit}"
     )
     return {"runs": rows or []}
+
+
+class SendNowRequest(BaseModel):
+    test_to: Optional[str] = None      # if set, ONLY send to this email (test mode)
+
+
+@app.post("/api/reports/send-now")
+async def send_now(
+    request: SendNowRequest,
+    background_tasks: BackgroundTasks,
+    x_reports_admin_key: str = Header(...),
+):
+    """
+    Admin-triggered manual send. Two modes:
+      - test_to=None    → send to ALL enabled recipients (same as cron run)
+      - test_to=<email> → send ONLY to that one address (Send to Me)
+
+    Returns immediately with the run_id; check /api/reports/runs for outcome.
+    """
+    verify_reports_admin_secret(x_reports_admin_key)
+
+    test_to = (request.test_to or "").strip().lower() or None
+    if test_to and "@" not in test_to:
+        raise HTTPException(status_code=400, detail="Invalid test_to email address")
+
+    triggered_by = "admin-test" if test_to else "admin-manual"
+    run = await sb_insert("report_runs", {
+        "type": "daily_summary",
+        "status": "pending",
+        "triggered_by": triggered_by,
+    })
+
+    background_tasks.add_task(_execute_daily_report, run["id"], test_to)
+
+    return {
+        "run_id": run["id"],
+        "status": "pending",
+        "test_to": test_to,
+        "triggered_by": triggered_by,
+    }
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
