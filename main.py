@@ -60,6 +60,7 @@ SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/").removesuffix("/rest
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ELEVEN_LABS_API_KEY = os.getenv("ELEVEN_LABS_API_KEY")
 FIX_LAB_SECRET = os.getenv("FIX_LAB_SECRET")
+REPORTS_WEBHOOK_SECRET = os.getenv("REPORTS_WEBHOOK_SECRET")  # used by pg_cron → /api/reports/run-daily
 LIVE_PUBLISH_SECRET = os.getenv("LIVE_PUBLISH_SECRET")  # required for /api/publish/*
 LINEAR_API_KEY = os.getenv("LINEAR_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -2557,6 +2558,232 @@ async def get_publish_job(job_id: str, x_publish_key: str = Header(...)):
     if not job:
         raise HTTPException(status_code=404, detail="Publish job not found")
     return job
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DAILY REVIEWER PROGRESS REPORT
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Triggered by Supabase pg_cron at 04:30 UTC (10:00 IST) daily via
+# net.http_post calling POST /api/reports/run-daily with header
+# x-reports-secret = REPORTS_WEBHOOK_SECRET.
+#
+# Admin UI can also:
+#   - Preview the rendered email at any time (no send)
+#   - Trigger a manual send via POST /api/reports/run-daily with the secret
+#   - Manage recipients (CRUD)
+#   - Browse send history
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RecipientCreate(BaseModel):
+    email: str
+    name: Optional[str] = None
+    enabled: bool = True
+
+
+class RecipientUpdate(BaseModel):
+    enabled: Optional[bool] = None
+    name: Optional[str] = None
+
+
+def verify_reports_secret(x_reports_secret: str = Header(...)):
+    """Auth for /api/reports/run-daily (called by Supabase pg_cron).
+    Uses its own secret so the cron call doesn't need a fix-lab admin key."""
+    if not REPORTS_WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Reports webhook not configured: set REPORTS_WEBHOOK_SECRET env var"
+        )
+    if x_reports_secret != REPORTS_WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid reports webhook secret")
+    return True
+
+
+@app.post("/api/reports/run-daily")
+async def run_daily_report(
+    background_tasks: BackgroundTasks,
+    x_reports_secret: str = Header(...),
+):
+    """
+    Build + send the daily report. Auth via x-reports-secret header.
+
+    Called by Supabase pg_cron daily at 10am IST, OR manually by an admin
+    via the Reports tab "Send now" button.
+
+    Returns immediately with the report_run row id; actual send happens
+    in the background. Poll GET /api/reports/runs to see status.
+    """
+    verify_reports_secret(x_reports_secret)
+
+    # Create run row in 'pending' state
+    run = await sb_insert("report_runs", {
+        "type": "daily_summary",
+        "status": "pending",
+        "triggered_by": "cron-or-manual",
+    })
+
+    background_tasks.add_task(_execute_daily_report, run["id"])
+
+    return {
+        "run_id": run["id"],
+        "status": "pending",
+        "message": "Report queued. Poll /api/reports/runs for outcome.",
+    }
+
+
+async def _execute_daily_report(run_id: str):
+    """Background worker — builds payload, sends email, updates run row."""
+    from reports import (
+        build_report_payload, render_html, send_email,
+        report_subject, headline_summary,
+    )
+
+    try:
+        # 1. Build payload
+        logger.info(f"Reports[{run_id}]: building payload…")
+        payload = await build_report_payload(sb_rpc)
+        summary = headline_summary(payload)
+
+        # 2. Render HTML + subject
+        html_body = render_html(payload)
+        subject   = report_subject(payload)
+
+        # 3. Load enabled recipients
+        rows = await sb_get("report_recipients?enabled=eq.true&select=email,name")
+        to_addresses = [r["email"] for r in rows if r.get("email")]
+        if not to_addresses:
+            raise RuntimeError("No enabled recipients in report_recipients table")
+
+        # 4. Send
+        await send_email(to_addresses, subject, html_body)
+
+        # 5. Mark success
+        await sb_patch("report_runs", run_id, {
+            "status": "sent",
+            "recipients_count": len(to_addresses),
+            "payload_summary": summary,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        })
+        logger.info(f"Reports[{run_id}]: ✅ sent to {len(to_addresses)} recipients")
+
+    except Exception as e:
+        logger.error(f"Reports[{run_id}]: ❌ failed — {e}")
+        try:
+            await sb_patch("report_runs", run_id, {
+                "status": "failed",
+                "error": str(e)[:500],
+            })
+        except Exception:
+            pass
+
+
+@app.get("/api/reports/preview")
+async def preview_daily_report(x_fix_lab_key: str = Header(...)):
+    """
+    Render the report HTML WITHOUT sending. Used by admin Reports tab
+    preview. Auth via x-fix-lab-key (admin key, same as Fix Lab).
+    """
+    verify_secret(x_fix_lab_key)
+    from reports import build_report_payload, render_html, report_subject
+
+    payload  = await build_report_payload(sb_rpc)
+    html_body = render_html(payload)
+    subject   = report_subject(payload)
+
+    return {
+        "subject": subject,
+        "html": html_body,
+        "payload": payload,
+    }
+
+
+@app.get("/api/reports/recipients")
+async def list_recipients(x_fix_lab_key: str = Header(...)):
+    """List all report recipients (enabled and disabled)."""
+    verify_secret(x_fix_lab_key)
+    rows = await sb_get("report_recipients?select=*&order=created_at.desc")
+    return {"recipients": rows or []}
+
+
+@app.post("/api/reports/recipients")
+async def create_recipient(
+    request: RecipientCreate,
+    x_fix_lab_key: str = Header(...),
+):
+    """Add a recipient. UNIQUE constraint on email prevents duplicates."""
+    verify_secret(x_fix_lab_key)
+    if not request.email or "@" not in request.email:
+        raise HTTPException(status_code=400, detail="Invalid email address")
+    try:
+        row = await sb_insert("report_recipients", {
+            "email": request.email.strip().lower(),
+            "name":  request.name,
+            "enabled": request.enabled,
+        })
+        return row
+    except Exception as e:
+        # UNIQUE violation → 23505 in PG; surface a friendly 409
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            raise HTTPException(
+                status_code=409,
+                detail=f"{request.email} is already a recipient"
+            )
+        raise
+
+
+@app.patch("/api/reports/recipients/{recipient_id}")
+async def update_recipient(
+    recipient_id: str,
+    request: RecipientUpdate,
+    x_fix_lab_key: str = Header(...),
+):
+    """Toggle enabled or update name. Email is immutable (remove + add to change)."""
+    verify_secret(x_fix_lab_key)
+    try:
+        uuid.UUID(recipient_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid recipient id")
+    update = {}
+    if request.enabled is not None:
+        update["enabled"] = request.enabled
+    if request.name is not None:
+        update["name"] = request.name
+    if not update:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    await sb_patch("report_recipients", recipient_id, update)
+    return {"id": recipient_id, **update}
+
+
+@app.delete("/api/reports/recipients/{recipient_id}")
+async def delete_recipient(recipient_id: str, x_fix_lab_key: str = Header(...)):
+    """Remove a recipient entirely."""
+    verify_secret(x_fix_lab_key)
+    try:
+        uuid.UUID(recipient_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid recipient id")
+    # PostgREST: DELETE via filter
+    r = await http_client.delete(
+        f"{SUPABASE_URL}/rest/v1/report_recipients?id=eq.{recipient_id}",
+        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=f"Delete failed: {r.status_code}")
+    return {"id": recipient_id, "deleted": True}
+
+
+@app.get("/api/reports/runs")
+async def list_runs(
+    limit: int = 20,
+    x_fix_lab_key: str = Header(...),
+):
+    """Last N report runs for the admin history view."""
+    verify_secret(x_fix_lab_key)
+    limit = min(max(limit, 1), 100)
+    rows = await sb_get(
+        f"report_runs?select=*&order=created_at.desc&limit={limit}"
+    )
+    return {"runs": rows or []}
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
