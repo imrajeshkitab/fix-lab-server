@@ -32,6 +32,7 @@ REPORTS_FROM_EMAIL  = os.getenv("REPORTS_FROM_EMAIL", "onboarding@resend.dev")
 REPORTS_FROM_NAME   = os.getenv("REPORTS_FROM_NAME", "Kitab RMS Bot")
 REPORTS_TIMEZONE    = os.getenv("REPORTS_TIMEZONE", "Asia/Kolkata")
 RESEND_API_URL      = "https://api.resend.com/emails"
+SMTP_USER           = os.getenv("SMTP_USER")
 
 
 # ─────────────────────────── Payload construction ────────────────────────────
