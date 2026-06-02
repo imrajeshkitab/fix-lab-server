@@ -25,13 +25,13 @@ logger = logging.getLogger("fix-lab.reports")
 
 
 # ────────────────────────────── Env / config ─────────────────────────────────
-# Resend (HTTPS, port 443 — works on Render free tier)
+# Brevo (HTTPS, port 443 — works on Render free tier)
 
-RESEND_API_KEY      = os.getenv("RESEND_API_KEY")
-REPORTS_FROM_EMAIL  = os.getenv("REPORTS_FROM_EMAIL", "onboarding@resend.dev")
+BREVO_API_KEY       = os.getenv("BREVO_API_KEY")
+REPORTS_FROM_EMAIL  = os.getenv("REPORTS_FROM_EMAIL", "rajesh.kumar@kitab.com")
 REPORTS_FROM_NAME   = os.getenv("REPORTS_FROM_NAME", "Kitab RMS Bot")
 REPORTS_TIMEZONE    = os.getenv("REPORTS_TIMEZONE", "Asia/Kolkata")
-RESEND_API_URL      = "https://api.resend.com/emails"
+BREVO_API_URL       = "https://api.brevo.com/v3/smtp/email"
 SMTP_USER           = os.getenv("SMTP_USER")
 
 
@@ -335,53 +335,46 @@ async def send_email(
     html_body: str,
 ) -> None:
     """
-    Send via Resend HTTPS API. Raises on failure so the worker can record
+    Send via Brevo HTTPS API. Raises on failure so the worker can record
     it in report_runs.error.
-
-    NOTE on sender restrictions (Resend free tier):
-      - If REPORTS_FROM_EMAIL is 'onboarding@resend.dev' (the default), Resend
-        only delivers to the Resend account owner's verified email — anti-spam.
-        Verify your own domain at https://resend.com/domains to send to any
-        address.
-      - Once a domain is verified (e.g. kitab.com), set
-        REPORTS_FROM_EMAIL=rajesh.kumar@kitab.com (or similar).
     """
     if not to_addresses:
         raise RuntimeError("send_email called with empty recipient list")
-    if not RESEND_API_KEY:
-        raise RuntimeError("RESEND_API_KEY not set — configure in .env / Render env vars")
-
-    # Build "From" — Resend supports "Name <email>" RFC 5322 format
-    from_field = f"{REPORTS_FROM_NAME} <{REPORTS_FROM_EMAIL}>"
+    if not BREVO_API_KEY:
+        raise RuntimeError("BREVO_API_KEY not set — configure in .env / Render env vars")
 
     payload = {
-        "from":    from_field,
-        "to":      to_addresses,
+        "sender": {
+            "name":  REPORTS_FROM_NAME,
+            "email": REPORTS_FROM_EMAIL,
+        },
+        "to":      [{"email": email} for email in to_addresses],
         "subject": subject,
-        "html":    html_body,
+        "htmlContent": html_body,
     }
 
     headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "api-key":      BREVO_API_KEY,
         "Content-Type":  "application/json",
+        "Accept":        "application/json",
     }
 
     logger.info(
-        f"Reports: POST to Resend for {len(to_addresses)} recipient(s) "
+        f"Reports: POST to Brevo for {len(to_addresses)} recipient(s) "
         f"from <{REPORTS_FROM_EMAIL}>"
     )
 
-    r = await http_client.post(RESEND_API_URL, headers=headers, json=payload, timeout=30)
+    r = await http_client.post(BREVO_API_URL, headers=headers, json=payload, timeout=30)
     if r.status_code not in (200, 201, 202):
         # Surface the response body so report_runs.error is actionable
         body = (r.text or "")[:500]
-        raise RuntimeError(f"Resend API HTTP {r.status_code}: {body}")
+        raise RuntimeError(f"Brevo API HTTP {r.status_code}: {body}")
 
-    # Resend returns { "id": "..." } on success
+    # Brevo returns { "messageId": "..." } on success
     result = r.json() if r.content else {}
     logger.info(
         f"Reports: email sent ✅ to {len(to_addresses)} recipient(s) "
-        f"(resend_id={result.get('id', '?')})"
+        f"(message_id={result.get('messageId', '?')})"
     )
 
 
