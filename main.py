@@ -2856,6 +2856,87 @@ async def send_now(
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# REPORT SCHEDULE — admin-editable pg_cron expression
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Two endpoints let the admin Reports tab view and update the daily
+# report's pg_cron schedule without running raw SQL.
+#
+# Calls into two Postgres wrapper RPCs (SECURITY DEFINER) — see
+# migrations/008_reports_schedule_rpcs.sql. The wrappers handle the
+# cron schema access; the backend just relays cron expressions.
+#
+# IST ↔ UTC math happens on the frontend: admin picks 10:00 IST, UI
+# converts to 04:30 UTC, sends cron expression '30 4 * * *'. Backend
+# stays timezone-agnostic.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ScheduleUpdate(BaseModel):
+    cron: str          # standard 5-field cron expression in UTC
+
+
+def _validate_cron_expression(expr: str) -> None:
+    """Sanity-check the cron expression before sending it to Postgres."""
+    if not expr or not isinstance(expr, str):
+        raise HTTPException(status_code=400, detail="cron expression is required")
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise HTTPException(
+            status_code=400,
+            detail=f"cron expression must have 5 fields (minute hour day month dow), got {len(parts)}"
+        )
+    # No injection: cron expressions only contain digits, *, /, -, ,
+    import re as _re
+    if not _re.match(r'^[\d\s\*/,\-]+$', expr.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="cron expression contains invalid characters"
+        )
+
+
+@app.get("/api/reports/schedule")
+async def get_schedule(x_reports_admin_key: str = Header(...)):
+    """Read the current pg_cron schedule for the daily report job."""
+    verify_reports_admin_secret(x_reports_admin_key)
+    try:
+        result = await sb_rpc("get_report_cron_schedule", {})
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not read schedule: {str(e)[:200]}"
+        )
+    return result
+
+
+@app.patch("/api/reports/schedule")
+async def update_schedule(
+    request: ScheduleUpdate,
+    x_reports_admin_key: str = Header(...),
+):
+    """
+    Update the pg_cron schedule for the daily report job.
+
+    Body: { "cron": "30 4 * * *" }     ← UTC, standard 5-field cron expression
+
+    Times are UTC because that's what pg_cron uses internally. The admin UI
+    converts from IST (user-friendly) before sending.
+    """
+    verify_reports_admin_secret(x_reports_admin_key)
+    expr = request.cron.strip()
+    _validate_cron_expression(expr)
+    try:
+        result = await sb_rpc("update_report_cron_schedule", {"p_cron": expr})
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not update schedule: {str(e)[:200]}"
+        )
+    logger.info(f"Reports: pg_cron schedule updated → '{expr}'")
+    return result
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
