@@ -52,6 +52,9 @@ def headline_summary(payload: dict) -> dict:
     delta = payload.get("delta") or {}
     return {
         "completed_24h":       delta.get("completed_24h", 0),
+        "corrected_24h":       delta.get("corrected_24h", 0),
+        "rereview_24h":        delta.get("rereview_24h", 0),
+        "reviewed_24h":        delta.get("reviewed_24h", 0),
         "new_assignments_24h": delta.get("new_assignments_24h", 0),
         "net_backlog_change":  delta.get("net_backlog_change", 0),
     }
@@ -199,17 +202,25 @@ def _render_delta(delta: dict) -> str:
     if not delta:
         return ""
     completed = int(delta.get("completed_24h", 0))
+    corrected = int(delta.get("corrected_24h", 0))
+    rereview  = int(delta.get("rereview_24h", 0))
+    reviewed  = int(delta.get("reviewed_24h", 0)) or (completed + corrected)
     new_a     = int(delta.get("new_assignments_24h", 0))
     net       = int(delta.get("net_backlog_change", 0))
     cls = "delta-positive" if net > 0 else ("delta-negative" if net < 0 else "delta-zero")
     arrow = "▲" if net > 0 else ("▼" if net < 0 else "▶")
     return f"""
-    <p style="font-size:14px;">
+    <p style="font-size:14px; margin-bottom: 4px;">
       <strong>Backlog change:</strong>
       <span class="{cls}">{arrow} {net:+d}</span>
-      &nbsp;&nbsp;
-      ({completed} completed, {new_a} new assignments)
     </p>
+    <ul style="font-size: 13px; color: #475569; margin-top: 4px; padding-left: 18px;">
+      <li><strong>{reviewed}</strong> reviewed
+          &nbsp;<span style="color:#6b7280;">({completed} approved + {corrected} sent for correction)</span>
+      </li>
+      <li><strong>{rereview}</strong> sent for re-review</li>
+      <li><strong>{new_a}</strong> new assignments</li>
+    </ul>
     """
 
 
