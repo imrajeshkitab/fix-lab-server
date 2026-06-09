@@ -169,17 +169,8 @@ def verify_secret(x_fix_lab_key: str = Header(...)):
     return True
 
 
-def verify_publish_secret(x_publish_key: str = Header(...)):
-    """Separate auth for /api/publish/* endpoints. Live-prod writes warrant a
-    different key from fix-lab ops."""
-    if not LIVE_PUBLISH_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail="Live Publish not configured: set LIVE_PUBLISH_SECRET env var"
-        )
-    if x_publish_key != LIVE_PUBLISH_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid Live Publish key")
-    return True
+# verify_publish_secret removed — Live Publish no longer requires a separate
+# secret key.  Access is controlled by the admin dashboard's Supabase Auth login.
 
 
 # ── Helper: Supabase queries via REST API ───────────────────────────────────
@@ -2182,7 +2173,6 @@ async def update_triage_result(
 async def get_publish_status(
     content_type: str = "bites",
     language: str = "en",
-    x_publish_key: str = Header(...),
 ):
     """
     Compute per-bite sync state for items approved (per-language) on RMS.
@@ -2198,10 +2188,7 @@ async def get_publish_status(
     Query params:
       content_type=bites   (only 'bites' supported in Phase A)
       language=en|hi
-
-    Auth: x-publish-key header must match LIVE_PUBLISH_SECRET env var.
     """
-    verify_publish_secret(x_publish_key)
 
     if content_type != "bites":
         raise HTTPException(status_code=400, detail="Only 'bites' supported in Phase A")
@@ -2500,13 +2487,8 @@ async def run_publish_job(job_id: str, items: List[PublishItem]):
 async def start_publish(
     request: PublishRequest,
     background_tasks: BackgroundTasks,
-    x_publish_key: str = Header(...),
 ):
-    """Start a publish job for a list of (bite_id, language) items.
-
-    Auth: x-publish-key header must match LIVE_PUBLISH_SECRET env var.
-    """
-    verify_publish_secret(x_publish_key)
+    """Start a publish job for a list of (bite_id, language) items."""
 
     if not request.items:
         raise HTTPException(status_code=400, detail="No items provided")
@@ -2551,12 +2533,8 @@ async def start_publish(
 
 
 @app.get("/api/publish/jobs/{job_id}")
-async def get_publish_job(job_id: str, x_publish_key: str = Header(...)):
-    """Poll publish job progress.
-
-    Auth: x-publish-key header must match LIVE_PUBLISH_SECRET env var.
-    """
-    verify_publish_secret(x_publish_key)
+async def get_publish_job(job_id: str):
+    """Poll publish job progress."""
 
     job = publish_jobs.get(job_id)
     if not job:
@@ -2603,18 +2581,9 @@ def verify_reports_secret(x_reports_secret: str = Header(...)):
     return True
 
 
-def verify_reports_admin_secret(x_reports_admin_key: str = Header(...)):
-    """Auth for admin Reports UI — separate from Fix Lab and Live Publish keys.
-    Used by: preview, recipients CRUD, runs history, manual send-now / send-test.
-    The cron webhook keeps its own REPORTS_WEBHOOK_SECRET; this is for humans."""
-    if not REPORTS_ADMIN_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail="Reports admin key not configured: set REPORTS_ADMIN_SECRET env var"
-        )
-    if x_reports_admin_key != REPORTS_ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid Reports admin key")
-    return True
+# verify_reports_admin_secret removed — Reports admin UI no longer requires a
+# separate secret key.  Access is controlled by the admin dashboard's Supabase
+# Auth login.  The cron webhook (verify_reports_webhook_secret) is unaffected.
 
 
 @app.post("/api/reports/run-daily")
@@ -2708,12 +2677,10 @@ async def _execute_daily_report(run_id: str, test_to: Optional[str] = None):
 
 
 @app.get("/api/reports/preview")
-async def preview_daily_report(x_reports_admin_key: str = Header(...)):
+async def preview_daily_report():
     """
-    Render the report HTML WITHOUT sending. Used by admin Reports tab
-    preview. Auth via x-reports-admin-key.
+    Render the report HTML WITHOUT sending. Used by admin Reports tab preview.
     """
-    verify_reports_admin_secret(x_reports_admin_key)
     from reports import build_report_payload, render_html, report_subject
 
     payload  = await build_report_payload(sb_rpc)
@@ -2728,9 +2695,8 @@ async def preview_daily_report(x_reports_admin_key: str = Header(...)):
 
 
 @app.get("/api/reports/recipients")
-async def list_recipients(x_reports_admin_key: str = Header(...)):
+async def list_recipients():
     """List all report recipients (enabled and disabled)."""
-    verify_reports_admin_secret(x_reports_admin_key)
     rows = await sb_get("report_recipients?select=*&order=created_at.desc")
     return {"recipients": rows or []}
 
@@ -2738,10 +2704,8 @@ async def list_recipients(x_reports_admin_key: str = Header(...)):
 @app.post("/api/reports/recipients")
 async def create_recipient(
     request: RecipientCreate,
-    x_reports_admin_key: str = Header(...),
 ):
     """Add a recipient. UNIQUE constraint on email prevents duplicates."""
-    verify_reports_admin_secret(x_reports_admin_key)
     if not request.email or "@" not in request.email:
         raise HTTPException(status_code=400, detail="Invalid email address")
     try:
@@ -2765,10 +2729,8 @@ async def create_recipient(
 async def update_recipient(
     recipient_id: str,
     request: RecipientUpdate,
-    x_reports_admin_key: str = Header(...),
 ):
     """Toggle enabled or update name. Email is immutable (remove + add to change)."""
-    verify_reports_admin_secret(x_reports_admin_key)
     try:
         uuid.UUID(recipient_id)
     except ValueError:
@@ -2785,9 +2747,8 @@ async def update_recipient(
 
 
 @app.delete("/api/reports/recipients/{recipient_id}")
-async def delete_recipient(recipient_id: str, x_reports_admin_key: str = Header(...)):
+async def delete_recipient(recipient_id: str):
     """Remove a recipient entirely."""
-    verify_reports_admin_secret(x_reports_admin_key)
     try:
         uuid.UUID(recipient_id)
     except ValueError:
@@ -2805,10 +2766,8 @@ async def delete_recipient(recipient_id: str, x_reports_admin_key: str = Header(
 @app.get("/api/reports/runs")
 async def list_runs(
     limit: int = 20,
-    x_reports_admin_key: str = Header(...),
 ):
     """Last N report runs for the admin history view."""
-    verify_reports_admin_secret(x_reports_admin_key)
     limit = min(max(limit, 1), 100)
     rows = await sb_get(
         f"report_runs?select=*&order=created_at.desc&limit={limit}"
@@ -2824,7 +2783,6 @@ class SendNowRequest(BaseModel):
 async def send_now(
     request: SendNowRequest,
     background_tasks: BackgroundTasks,
-    x_reports_admin_key: str = Header(...),
 ):
     """
     Admin-triggered manual send. Two modes:
@@ -2833,7 +2791,6 @@ async def send_now(
 
     Returns immediately with the run_id; check /api/reports/runs for outcome.
     """
-    verify_reports_admin_secret(x_reports_admin_key)
 
     test_to = (request.test_to or "").strip().lower() or None
     if test_to and "@" not in test_to:
