@@ -39,7 +39,7 @@ import json
 import re
 import logging
 from typing import Optional, List, Dict, Any, Tuple
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import FastAPI, Header, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -2561,11 +2561,28 @@ class RecipientCreate(BaseModel):
     email: str
     name: Optional[str] = None
     enabled: bool = True
+    notify_daily: bool = True
+    notify_finish: bool = False
 
 
 class RecipientUpdate(BaseModel):
     enabled: Optional[bool] = None
     name: Optional[str] = None
+    notify_daily: Optional[bool] = None
+    notify_finish: Optional[bool] = None
+
+
+class WatchedReviewerCreate(BaseModel):
+    reviewer_id: str
+
+
+class WatchedReviewerUpdate(BaseModel):
+    enabled: bool
+
+
+class CheckFinishedRequest(BaseModel):
+    reviewer_id: Optional[str] = None
+    sweep: Optional[bool] = False
 
 
 def verify_reports_secret(x_reports_secret: str = Header(...)):
@@ -2657,7 +2674,7 @@ async def _execute_daily_report(run_id: str, test_to: Optional[str] = None):
             to_addresses = [test_to]
             logger.info(f"Reports[{run_id}]: TEST mode — sending only to {test_to}")
         else:
-            rows = await sb_get("report_recipients?enabled=eq.true&select=email,name")
+            rows = await sb_get("report_recipients?enabled=eq.true&notify_daily=eq.true&select=email,name")
             to_addresses = [r["email"] for r in rows if r.get("email")]
             if not to_addresses:
                 raise RuntimeError("No enabled recipients in report_recipients table")
@@ -2719,9 +2736,11 @@ async def create_recipient(
         raise HTTPException(status_code=400, detail="Invalid email address")
     try:
         row = await sb_insert("report_recipients", {
-            "email": request.email.strip().lower(),
-            "name":  request.name,
-            "enabled": request.enabled,
+            "email":         request.email.strip().lower(),
+            "name":          request.name,
+            "enabled":       request.enabled,
+            "notify_daily":  request.notify_daily,
+            "notify_finish": request.notify_finish,
         })
         return row
     except Exception as e:
@@ -2749,10 +2768,100 @@ async def update_recipient(
         update["enabled"] = request.enabled
     if request.name is not None:
         update["name"] = request.name
+    if request.notify_daily is not None:
+        update["notify_daily"] = request.notify_daily
+    if request.notify_finish is not None:
+        update["notify_finish"] = request.notify_finish
     if not update:
         raise HTTPException(status_code=400, detail="No fields to update")
     await sb_patch("report_recipients", recipient_id, update)
     return {"id": recipient_id, **update}
+
+
+# ── Watched reviewers & queue-empty alerts ──────────────────────────────────
+
+@app.get("/api/reports/reviewers")
+async def list_reviewers():
+    """All reviewers (for the watch-list 'Add reviewer' dropdown).
+    Returns id + full_name, ordered by name."""
+    rows = await sb_get("profiles?role=eq.reviewer&select=id,full_name&order=full_name.asc")
+    return {"reviewers": rows or []}
+
+
+@app.get("/api/reports/watched-reviewers")
+async def list_watched_reviewers():
+    """Current watch list with name + live pending count."""
+    rows = await sb_rpc("get_watched_reviewers", {})
+    return {"watched": rows or []}
+
+
+@app.post("/api/reports/watched-reviewers")
+async def add_watched_reviewer(request: WatchedReviewerCreate):
+    """Add a reviewer to the watch list. UNIQUE on reviewer_id → 409 if duplicate."""
+    try:
+        uuid.UUID(request.reviewer_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid reviewer id")
+    try:
+        row = await sb_insert("watched_reviewers", {
+            "reviewer_id": request.reviewer_id,
+            "enabled":     True,
+        })
+        return row
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            raise HTTPException(status_code=409, detail="Reviewer already in watch list")
+        raise
+
+
+@app.patch("/api/reports/watched-reviewers/{watch_id}")
+async def update_watched_reviewer(watch_id: str, request: WatchedReviewerUpdate):
+    """Enable/disable a watch entry without deleting it."""
+    try:
+        uuid.UUID(watch_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid watch id")
+    await sb_patch("watched_reviewers", watch_id, {"enabled": request.enabled})
+    return {"id": watch_id, "enabled": request.enabled}
+
+
+@app.delete("/api/reports/watched-reviewers/{watch_id}")
+async def delete_watched_reviewer(watch_id: str):
+    """Remove a reviewer from the watch list."""
+    try:
+        uuid.UUID(watch_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid watch id")
+    r = await http_client.delete(
+        f"{SUPABASE_URL}/rest/v1/watched_reviewers?id=eq.{watch_id}",
+        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+    )
+    if r.status_code not in (200, 204):
+        raise HTTPException(status_code=500, detail=f"Delete failed: {r.status_code}")
+    return {"id": watch_id, "deleted": True}
+
+
+@app.post("/api/reports/check-reviewer-finished")
+async def check_reviewer_finished(
+    request: CheckFinishedRequest,
+    background_tasks: BackgroundTasks,
+    x_reports_secret: str = Header(...),
+):
+    """Webhook called by the DB trigger (per-reviewer) and the daily backstop cron (sweep mode).
+
+    Modes:
+      { "reviewer_id": "<uuid>" } — one specific reviewer
+      { "sweep": true }           — iterate every enabled watched reviewer
+
+    Idempotent. Always returns 202; actual checks/emails run in the background.
+    """
+    verify_reports_secret(x_reports_secret)
+    background_tasks.add_task(
+        _run_reviewer_finished_check,
+        request.reviewer_id,
+        bool(request.sweep),
+    )
+    return {"accepted": True, "mode": "sweep" if request.sweep else "single"}
 
 
 @app.delete("/api/reports/recipients/{recipient_id}")
@@ -2901,6 +3010,153 @@ async def update_schedule(
         )
     logger.info(f"Reports: pg_cron schedule updated → '{expr}'")
     return result
+
+
+# ── Queue-empty notification worker ─────────────────────────────────────────
+
+ADMIN_BASE_URL = os.getenv(
+    "ADMIN_BASE_URL",
+    "https://kitab-gallery.vercel.app",
+).rstrip("/")
+
+
+def _build_queue_empty_email(reviewer_name: str, reviewer_id: str, done_24h: int) -> tuple:
+    """Returns (subject, html) for the queue-empty alert."""
+    safe_name = (reviewer_name or "Reviewer").strip()
+    cta_url = f"{ADMIN_BASE_URL}/admin?tab=assignments&reviewer={reviewer_id}"
+    subject = f"{safe_name} cleared their queue — assign more?"
+    html = f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+body {{ font-family: -apple-system, system-ui, sans-serif; color:#1f2937; line-height:1.5; max-width:560px; margin:24px auto; padding:0 16px; }}
+h1 {{ font-size:18px; margin:0 0 16px; color:#0f172a; }}
+.card {{ background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:16px 18px; margin:16px 0; }}
+.cta {{ display:inline-block; background:#2563eb; color:#fff !important; padding:10px 18px; border-radius:6px; text-decoration:none; font-weight:600; margin-top:8px; }}
+.muted {{ color:#6b7280; font-size:13px; }}
+</style></head>
+<body>
+  <h1>📭 Queue cleared</h1>
+  <p><strong>{safe_name}</strong> has just finished all assigned items.</p>
+  <div class="card">
+    <p style="margin:0;">✅ Completed in last 24h: <strong>{done_24h}</strong></p>
+    <p style="margin:6px 0 0;">📥 Pending now: <strong>0</strong></p>
+  </div>
+  <p>Consider assigning a fresh batch so they stay productive.</p>
+  <p><a class="cta" href="{cta_url}">Assign items to {safe_name} →</a></p>
+  <p class="muted">You're receiving this because you're on the queue-alert recipients list in the Kitab RMS admin dashboard.</p>
+</body></html>"""
+    return subject, html
+
+
+async def _upsert_finish_notification(reviewer_id: str, pending_when_sent: int = 0):
+    """Mark this reviewer as 'notified, awaiting next clear-cycle'."""
+    existing = await sb_get(
+        f"reviewer_finish_notifications?reviewer_id=eq.{reviewer_id}&select=reviewer_id"
+    )
+    payload = {
+        "notified_at":       datetime.now(timezone.utc).isoformat(),
+        "pending_when_sent": pending_when_sent,
+        "cleared":           False,
+    }
+    if existing:
+        await sb_patch_where(
+            "reviewer_finish_notifications",
+            f"reviewer_id=eq.{reviewer_id}",
+            payload,
+        )
+    else:
+        await sb_insert("reviewer_finish_notifications", {
+            "reviewer_id": reviewer_id,
+            **payload,
+        })
+
+
+async def _process_one_reviewer_finish_check(target: dict) -> None:
+    """Apply the queue-empty rules for a single watched reviewer."""
+    rid     = target.get("reviewer_id")
+    pending = int(target.get("pending_now") or 0)
+    name    = target.get("full_name") or "Unknown"
+
+    if not rid:
+        return
+
+    # Read prior notification (state-based dedupe)
+    prior_rows = await sb_get(
+        f"reviewer_finish_notifications?reviewer_id=eq.{rid}&select=*"
+    )
+    prior = (prior_rows or [None])[0]
+
+    if pending > 0:
+        # Reviewer picked up new work — clear the 'sent' marker so the next
+        # transition-to-zero can fire a fresh email.
+        if prior and not prior.get("cleared"):
+            await sb_patch_where(
+                "reviewer_finish_notifications",
+                f"reviewer_id=eq.{rid}",
+                {"cleared": True},
+            )
+        return
+
+    # pending == 0 from here on
+    if prior and not prior.get("cleared"):
+        logger.info(f"queue-empty: already notified for {name} ({rid}); skipping")
+        return
+
+    # Require recent activity — otherwise this is an idle-empty queue, not a
+    # "just finished" event worth pinging supervisors about.
+    since_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    activity = await sb_get(
+        f"content_assignments?reviewer_id=eq.{rid}"
+        f"&status=in.(completed,changes_requested)"
+        f"&updated_at=gte.{since_iso}&select=id,status"
+    )
+    if not activity:
+        return
+
+    done_24h = sum(1 for r in activity if r.get("status") == "completed")
+
+    recipients = await sb_get(
+        "report_recipients?enabled=eq.true&notify_finish=eq.true&select=email,name"
+    )
+    if not recipients:
+        logger.warning("queue-empty: no notify_finish recipients configured")
+        return
+
+    subject, html = _build_queue_empty_email(name, rid, done_24h)
+    to_list = [r["email"] for r in recipients if r.get("email")]
+
+    from reports import send_email as _send_email
+    try:
+        await _send_email(http_client, to_list, subject, html)
+        logger.info(f"queue-empty: emailed {len(to_list)} supervisor(s) about {name}")
+    except Exception as e:
+        logger.error(f"queue-empty: send failed for {name}: {e}")
+        return
+
+    await _upsert_finish_notification(rid, pending_when_sent=0)
+
+
+async def _run_reviewer_finished_check(reviewer_id, sweep: bool) -> None:
+    """Background task entry point. Pulls watch list, filters, processes each."""
+    try:
+        rows = await sb_rpc("get_watched_reviewers", {})
+        enabled = [r for r in (rows or []) if r.get("enabled")]
+        if sweep:
+            targets = enabled
+        elif reviewer_id:
+            targets = [r for r in enabled if str(r.get("reviewer_id")) == str(reviewer_id)]
+        else:
+            return
+        for t in targets:
+            try:
+                await _process_one_reviewer_finish_check(t)
+            except Exception as inner:
+                logger.error(
+                    f"queue-empty: per-reviewer check failed for "
+                    f"{t.get('full_name')}: {inner}", exc_info=True
+                )
+    except Exception as e:
+        logger.error(f"queue-empty: worker failed: {e}", exc_info=True)
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
