@@ -1,0 +1,596 @@
+[
+  {
+    "idx": 0,
+    "id": "002e3a4c-1469-4aa6-a456-0c440cd10d1e",
+    "created_at": "2026-01-24 20:23:27.252987+00",
+    "updated_at": "2026-01-24 20:23:27.252987+00",
+    "cover": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/covers/JOU-79.webp",
+    "source_id": "JOU-79",
+    "author": "Kitab",
+    "title": "Embers to Awe",
+    "content": "{\"en\": \"## SECTION 1: Seeing the Disconnect\\n\\n### Welcome to the Journey\\n\\nHey,  setback. Take a deep breath and say ...",
+    "audio": {
+      "en": {
+        "chapters": [
+          {
+            "seq": 1,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section1_sub1_narration.mp3",
+            "type": "Narration",
+            "title": "Welcome to the Journey",
+            "section": 1,
+            "duration": 92,
+            "subsection": 1,
+            "section_title": "SECTION 1: Seeing the Disconnect"
+          },
+          {
+            "seq": 2,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section1_sub2_narration.mp3",
+            "type": "Narration",
+            "title": "The Ache of Modern Life",
+            "section": 1,
+            "duration": 91,
+            "subsection": 2,
+            "section_title": "SECTION 1: Seeing the Disconnect"
+          },
+          {
+            "seq": 3,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/chapter_02_Key_Idea_1_of_4_Why_you_feel_better_outside_than_voice.mp3",
+            "type": "Narration",
+            "title": "The Nature Fix — Key Idea 1 of 4: Why you feel better outside than you think",
+            "section": 1,
+            "duration": 197,
+            "subsection": 3,
+            "section_title": "SECTION 1: Seeing the Disconnect"
+          },
+          {
+            "seq": 4,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section1_sub4_narration.mp3",
+            "type": "Narration",
+            "title": "Recognizing Your Own Disconnect",
+            "section": 1,
+            "duration": 105,
+            "subsection": 4,
+            "section_title": "SECTION 1: Seeing the Disconnect"
+          },
+          {
+            "seq": 5,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section2_sub1_narration.mp3",
+            "type": "Narration",
+            "title": "Shifting from Seeing to Doing",
+            "section": 2,
+            "duration": 82,
+            "subsection": 1,
+            "section_title": "SECTION 2: Cultivating an Inner Garden"
+          },
+          {
+            "seq": 6,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/chapter_05_Key_Idea_4_of_6_Before_you_can_change_your_life_voice.mp3",
+            "type": "Narration",
+            "title": "The Book of Joy — Key Idea 4 of 6: Before you can change your life, you must accept it.",
+            "section": 2,
+            "duration": 211,
+            "subsection": 2,
+            "section_title": "SECTION 2: Cultivating an Inner Garden"
+          },
+          {
+            "seq": 7,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section2_sub3_narration.mp3",
+            "type": "Narration",
+            "title": "From Acceptance to Gratitude",
+            "section": 2,
+            "duration": 107,
+            "subsection": 3,
+            "section_title": "SECTION 2: Cultivating an Inner Garden"
+          },
+          {
+            "seq": 8,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/chapter_07_Key_Idea_6_of_6_Instead_of_comparing_yourself_to_voice.mp3",
+            "type": "Narration",
+            "title": "The Book of Joy — Key Idea 6 of 6: Instead of comparing yourself to others, practice gratitude.",
+            "section": 2,
+            "duration": 181,
+            "subsection": 4,
+            "section_title": "SECTION 2: Cultivating an Inner Garden"
+          },
+          {
+            "seq": 9,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section2_sub5_narration.mp3",
+            "type": "Narration",
+            "title": "Your First Gratitude Practice",
+            "section": 2,
+            "duration": 100,
+            "subsection": 5,
+            "section_title": "SECTION 2: Cultivating an Inner Garden"
+          },
+          {
+            "seq": 10,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section3_sub1_narration.mp3",
+            "type": "Narration",
+            "title": "From the Inner Garden to the Outer World",
+            "section": 3,
+            "duration": 69,
+            "subsection": 1,
+            "section_title": "SECTION 3: Carrying Wonder Forward"
+          },
+          {
+            "seq": 11,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/chapter_05_Key_Idea_4_of_4_To_feel_more_connected_feel_smal_voice.mp3",
+            "type": "Narration",
+            "title": "The Nature Fix — Key Idea 4 of 4: To feel more connected, feel smaller first",
+            "section": 3,
+            "duration": 194,
+            "subsection": 2,
+            "section_title": "SECTION 3: Carrying Wonder Forward"
+          },
+          {
+            "seq": 12,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section3_sub3_narration.mp3",
+            "type": "Narration",
+            "title": "Making Awe a Practice",
+            "section": 3,
+            "duration": 108,
+            "subsection": 3,
+            "section_title": "SECTION 3: Carrying Wonder Forward"
+          },
+          {
+            "seq": 13,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/chapter_04_Key_Idea_3_of_4_Find_your_dose_from_five_minutes_voice.mp3",
+            "type": "Narration",
+            "title": "The Nature Fix — Key Idea 3 of 4: Find your dose: from five minutes to five days",
+            "section": 3,
+            "duration": 241,
+            "subsection": 4,
+            "section_title": "SECTION 3: Carrying Wonder Forward"
+          },
+          {
+            "seq": 14,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/embers_to_awe/section3_sub5_narration.mp3",
+            "type": "Narration",
+            "title": "Designing Your Path Forward",
+            "section": 3,
+            "duration": 126,
+            "subsection": 5,
+            "section_title": "SECTION 3: Carrying Wonder Forward"
+          }
+        ],
+        "total_duration": 1904
+      }
+    },
+    "source": "Kitab",
+    "content_chapterwise": "{\"en\": {\"1.1\": \"Hey, ..Let's begin.\", \"1.2\": \"That ... back after.\", \"1.3\": \"When author ... answers.\", \"1.4\": \"\\\"Nature ...right where we are.\\n\\n---\", \"2.1\": \"So, we've ... after.\", \"2.2\": \"Life ..forgiveness.\", \"2.3\": \"A \\\"bad axle.\\\" That's such a perfect way to describe that feeling of grinding against reality, isn't it? The key tak...",
+    "tags": null
+  },
+  {
+    "idx": 1,
+    "id": "0610db47-e2f8-43c9-8f47-fd23c8f18ba2",
+    "created_at": "2025-09-23 20:07:07.507999+00",
+    "updated_at": "2025-09-25 20:23:23+00",
+    "cover": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/covers/Anger_to_Love.webp",
+    "source_id": "JOU-16",
+    "author": "Kitab",
+    "title": "Anger to Love",
+    "content": "{\"en\": \"## Understanding Anger\\n\\n### Introduction\\n\\nHello, .... feeling itself, but from the automatic,...",
+    "audio": {
+      "en": {
+        "chapters": [
+          {
+            "seq": 1,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_8847c0855237bd3a17da_0.mp3?",
+            "type": "Narration",
+            "title": "Introduction",
+            "section": 0,
+            "duration": 89,
+            "subsection": 1,
+            "section_title": "Understanding Anger"
+          },
+          {
+            "seq": 2,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_8847c0855237bd3a17da_1.mp3?",
+            "type": "Narration",
+            "title": "Patterns of Anger",
+            "section": 0,
+            "duration": 54,
+            "subsection": 2,
+            "section_title": "Understanding Anger"
+          },
+          {
+            "seq": 3,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/summaries/cover-pages/9a23b2da5111ed31f263714d_Anger Management for Everyone: Ten Proven Strategies to Help You Control Anger and Live a Happier Life.webp?",
+            "type": "Narration",
+            "title": "Anger management for everyone",
+            "section": 0,
+            "duration": 813,
+            "subsection": 3,
+            "section_title": "Understanding Anger"
+          },
+          {
+            "seq": 4,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_8847c0855237bd3a17da_3.mp3?",
+            "type": "Narration",
+            "title": "Awareness is your new superpower",
+            "section": 0,
+            "duration": 84,
+            "subsection": 4,
+            "section_title": "Understanding Anger"
+          },
+          {
+            "seq": 5,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_ed88cb7b8ca350bf6e63_0.mp3?",
+            "type": "Narration",
+            "title": "Conscious Choice",
+            "section": 1,
+            "duration": 72,
+            "subsection": 1,
+            "section_title": "Regulating Anger"
+          },
+          {
+            "seq": 6,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/anger_to_Love_book.mp3",
+            "type": "Narration",
+            "title": "From Anger to love",
+            "section": 1,
+            "duration": 451,
+            "subsection": 2,
+            "section_title": "Regulating Anger"
+          },
+          {
+            "seq": 7,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_ed88cb7b8ca350bf6e63_2.mp3?",
+            "type": "Narration",
+            "title": "Learning to heal yourself",
+            "section": 1,
+            "duration": 80,
+            "subsection": 3,
+            "section_title": "Regulating Anger"
+          },
+          {
+            "seq": 8,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_20c07f340830e4b94a36_0.mp3?",
+            "type": "Narration",
+            "title": "Making love your default state",
+            "section": 2,
+            "duration": 77,
+            "subsection": 1,
+            "section_title": "Learning To Heal Yourself"
+          },
+          {
+            "seq": 9,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/Journey_anger_to_love3.mp3",
+            "type": "Narration",
+            "title": "From Anger to love",
+            "section": 2,
+            "duration": 426,
+            "subsection": 2,
+            "section_title": "Learning To Heal Yourself"
+          },
+          {
+            "seq": 10,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/journey_4577782e3d_20c07f340830e4b94a36_2.mp3?",
+            "type": "Narration",
+            "title": "Wrapping Up",
+            "section": 2,
+            "duration": 108,
+            "subsection": 3,
+            "section_title": "Learning To Heal Yourself"
+          }
+        ],
+        "total_duration": 2254
+      }
+    },
+    "source": "Kitab",
+    "content_chapterwise": "{\"en\": {\"0.1\": \"Hello, and  Let's begin.\", \"0.2\": \"This ... change.\", \"0.3\": \"Key Idea 1: .... your mind.\", \"0.4\": \"You’ve .... triggers in the moment.\", \"1.1\": \"Welcome ... begins.\", \"1.2\": \"Key ... To master an...",
+    "tags": null
+  },
+  {
+    "idx": 2,
+    "id": "063b4a2c-6ee8-49f9-b826-c68472bc2574",
+    "created_at": "2026-01-24 20:23:09.138455+00",
+    "updated_at": "2026-01-24 20:23:09.138455+00",
+    "cover": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/covers/JOU-76.webp",
+    "source_id": "JOU-76",
+    "author": "Kitab",
+    "title": "Let Go Lab",
+    "content": "{\"en\": \"## SECTION 1: Naming Your ....., what's t...",
+    "audio": {
+      "en": {
+        "chapters": [
+          {
+            "seq": 1,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section1_sub1_narration.mp3",
+            "type": "Narration",
+            "title": "Welcome to the Let Go Lab",
+            "section": 1,
+            "duration": 98,
+            "subsection": 1,
+            "section_title": "SECTION 1: Naming Your Inner Roommate"
+          },
+          {
+            "seq": 2,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section1_sub2_narration.mp3",
+            "type": "Narration",
+            "title": "The Voice That Never Stops",
+            "section": 1,
+            "duration": 100,
+            "subsection": 2,
+            "section_title": "SECTION 1: Naming Your Inner Roommate"
+          },
+          {
+            "seq": 3,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/chapter_02_Key_Idea_1_of_6_Instead_of_obeying_your_inner_nar_voice.mp3",
+            "type": "Narration",
+            "title": "The Untethered Soul — Key Idea 1 of 6: Instead of obeying your inner narrator, just watch it",
+            "section": 1,
+            "duration": 188,
+            "subsection": 3,
+            "section_title": "SECTION 1: Naming Your Inner Roommate"
+          },
+          {
+            "seq": 4,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section1_sub4_narration.mp3",
+            "type": "Narration",
+            "title": "What Is Your Roommate Trying to Protect?",
+            "section": 1,
+            "duration": 105,
+            "subsection": 4,
+            "section_title": "SECTION 1: Naming Your Inner Roommate"
+          },
+          {
+            "seq": 5,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/chapter_03_Key_Idea_2_of_6_Why_closing_your_heart_creates_i_voice.mp3",
+            "type": "Narration",
+            "title": "The Untethered Soul — Key Idea 2 of 6: Why closing your heart creates \"inner thorns\"",
+            "section": 1,
+            "duration": 206,
+            "subsection": 5,
+            "section_title": "SECTION 1: Naming Your Inner Roommate"
+          },
+          {
+            "seq": 6,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section1_sub6_narration.mp3",
+            "type": "Narration",
+            "title": "Mapping Your Own Thorns",
+            "section": 1,
+            "duration": 112,
+            "subsection": 6,
+            "section_title": "SECTION 1: Naming Your Inner Roommate"
+          },
+          {
+            "seq": 7,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section2_sub1_narration.mp3",
+            "type": "Narration",
+            "title": "From Understanding to Practice",
+            "section": 2,
+            "duration": 63,
+            "subsection": 1,
+            "section_title": "SECTION 2: The Practice of Being Here Now"
+          },
+          {
+            "seq": 8,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section2_sub2_narration.mp3",
+            "type": "Narration",
+            "title": "The Simplest, Hardest Instruction",
+            "section": 2,
+            "duration": 73,
+            "subsection": 2,
+            "section_title": "SECTION 2: The Practice of Being Here Now"
+          },
+          {
+            "seq": 9,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/chapter_03_Key_Idea_2_of_6_To_find_peace_be_here_now_voice.mp3",
+            "type": "Narration",
+            "title": "Be Here Now — Key Idea 2 of 6: To find peace, be here now",
+            "section": 2,
+            "duration": 160,
+            "subsection": 3,
+            "section_title": "SECTION 2: The Practice of Being Here Now"
+          },
+          {
+            "seq": 10,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section2_sub4_narration.mp3",
+            "type": "Narration",
+            "title": "Where Am I? What Time Is It?",
+            "section": 2,
+            "duration": 99,
+            "subsection": 4,
+            "section_title": "SECTION 2: The Practice of Being Here Now"
+          },
+          {
+            "seq": 11,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/chapter_04_Key_Idea_3_of_6_Instead_of_being_your_thoughts_w_voice.mp3",
+            "type": "Narration",
+            "title": "Be Here Now — Key Idea 3 of 6: Instead of being your thoughts, watch them",
+            "section": 2,
+            "duration": 152,
+            "subsection": 5,
+            "section_title": "SECTION 2: The Practice of Being Here Now"
+          },
+          {
+            "seq": 12,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section2_sub6_narration.mp3",
+            "type": "Narration",
+            "title": "You Are the Sky, Not the Clouds",
+            "section": 2,
+            "duration": 109,
+            "subsection": 6,
+            "section_title": "SECTION 2: The Practice of Being Here Now"
+          },
+          {
+            "seq": 13,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section3_sub1_narration.mp3",
+            "type": "Narration",
+            "title": "Carrying the Practice Forward",
+            "section": 3,
+            "duration": 88,
+            "subsection": 1,
+            "section_title": "SECTION 3: Choosing Freedom, Moment by Moment"
+          },
+          {
+            "seq": 14,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/chapter_06_Key_Idea_5_of_6_Remember_Staying_open_beats_stay_voice.mp3",
+            "type": "Narration",
+            "title": "The Untethered Soul — Key Idea 5 of 6: Remember: Staying open beats staying safe",
+            "section": 3,
+            "duration": 175,
+            "subsection": 2,
+            "section_title": "SECTION 3: Choosing Freedom, Moment by Moment"
+          },
+          {
+            "seq": 15,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section3_sub3_narration.mp3",
+            "type": "Narration",
+            "title": "Are You Willing to Trade Your Happiness for This?",
+            "section": 3,
+            "duration": 109,
+            "subsection": 3,
+            "section_title": "SECTION 3: Choosing Freedom, Moment by Moment"
+          },
+          {
+            "seq": 16,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/chapter_07_Key_Idea_6_of_6_Use_the_thought_of_death_to_live_voice.mp3",
+            "type": "Narration",
+            "title": "The Untethered Soul — Key Idea 6 of 6: Use the thought of death to live fully",
+            "section": 3,
+            "duration": 187,
+            "subsection": 4,
+            "section_title": "SECTION 3: Choosing Freedom, Moment by Moment"
+          },
+          {
+            "seq": 17,
+            "url": "https://ikkfyrjovqfirogpupat.supabase.co/storage/v1/object/public/content/journeys/let_go_lab/section3_sub5_narration.mp3",
+            "type": "Narration",
+            "title": "Your Journey from Here",
+            "section": 3,
+            "duration": 121,
+            "subsection": 5,
+            "section_title": "SECTION 3: Choosing Freedom, Moment by Moment"
+          }
+        ],
+        "total_duration": 2145
+      }
+    },
+    "source": "Kitab",
+    "content_chapterwise": "{\"en\": {\"1.1\": \"Hey, I'm Ananth. ... Let's begin.\", \"1.2\": \"So, ... done.\", \"1.3\": \"Imagine .... hearts.\", \"1.4\": \"Welcome .... I'll be here after.\", \"1.5\": \"Singer ... opposite.\", \"1.6\": \"Inner ...thorns, we ...",
+    "tags": null
+  },
+  {
+    "idx": 3,
+    "id": "085b1002-d315-5f5a-bd9e-b0e63e119c6f",
+    "created_at": "2025-09-25 20:02:33.304049+00",
+    "updated_at": "2025-09-25 20:23:41+00",
+    "cover": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/covers/Loneliness_to_Connection.webp",
+    "source_id": "JOU-18",
+    "author": "Kitab",
+    "title": "Loneliness to Connection",
+    "content": "{\"en\": \"## Understanding ....such as exercising...",
+    "audio": {
+      "en": {
+        "chapters": [
+          {
+            "seq": 1,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_311ad037-84f4-57f8-92fd-8aa84e086f58_0.mp3?",
+            "type": "Narration",
+            "title": "Your Path to Lasting Connection",
+            "section": 0,
+            "duration": 77,
+            "subsection": 1,
+            "section_title": "Understanding Loneliness"
+          },
+          {
+            "seq": 2,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_311ad037-84f4-57f8-92fd-8aa84e086f58_1.mp3?",
+            "type": "Narration",
+            "title": "Understanding Your Built in Need for Belonging",
+            "section": 0,
+            "duration": 58,
+            "subsection": 2,
+            "section_title": "Understanding Loneliness"
+          },
+          {
+            "seq": 3,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/summaries/cover-pages/294b263656934786db434c31_Loneliness: Human Nature and the Need for Social Connection.webp?",
+            "type": "Narration",
+            "title": "Loneliness Human Nature",
+            "section": 0,
+            "duration": 421,
+            "subsection": 3,
+            "section_title": "Understanding Loneliness"
+          },
+          {
+            "seq": 4,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_311ad037-84f4-57f8-92fd-8aa84e086f58_3.mp3?",
+            "type": "Narration",
+            "title": "From Understanding to Action",
+            "section": 0,
+            "duration": 85,
+            "subsection": 4,
+            "section_title": "Understanding Loneliness"
+          },
+          {
+            "seq": 5,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_a1fba066-6d8e-5942-bfe7-cd41fceb3972_0.mp3?",
+            "type": "Narration",
+            "title": "Turning Inward to Build Outward",
+            "section": 1,
+            "duration": 63,
+            "subsection": 1,
+            "section_title": "Rewiring for Meaningful Connection"
+          },
+          {
+            "seq": 6,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/connections_loneliness_cure_voice.mp3",
+            "type": "Narration",
+            "title": "The Loneliness Cure",
+            "section": 1,
+            "duration": 365,
+            "subsection": 2,
+            "section_title": "Rewiring for Meaningful Connection"
+          },
+          {
+            "seq": 7,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_a1fba066-6d8e-5942-bfe7-cd41fceb3972_2.mp3?",
+            "type": "Narration",
+            "title": "You Are Now in the Drivers Seat",
+            "section": 1,
+            "duration": 74,
+            "subsection": 3,
+            "section_title": "Rewiring for Meaningful Connection"
+          },
+          {
+            "seq": 8,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_dcfd619a-542f-57f8-9cc2-2e122d153da5_0.mp3?",
+            "type": "Narration",
+            "title": "Becoming the Architect of Your Social World",
+            "section": 2,
+            "duration": 56,
+            "subsection": 1,
+            "section_title": "Cultivating Connections"
+          },
+          {
+            "seq": 9,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/connections_art_of_gathering_voice.mp3",
+            "type": "Narration",
+            "title": "The Art of Gathering",
+            "section": 2,
+            "duration": 432,
+            "subsection": 2,
+            "section_title": "Cultivating Connections"
+          },
+          {
+            "seq": 10,
+            "url": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/journeys/audio/085b1002-d315-5f5a-bd9e-b0e63e119c6f_dcfd619a-542f-57f8-9cc2-2e122d153da5_2.mp3?",
+            "type": "Narration",
+            "title": "Wrapping Up",
+            "section": 2,
+            "duration": 110,
+            "subsection": 3,
+            "section_title": "Cultivating Connections"
+          }
+        ],
+        "total_duration": 1741
+      }
+    },
+    "source": "Kitab",
+    "content_chapterwise": "{\"en\": {\"0.1\": \"Welcome. ... together.\", \"0.2\": \"This first .... started.\", \"0.3\": \"Key Idea 1 .... detection.\", \"0.4\": \"You’.... you need.\", \"1.1\": \"Welcome ... bonds.\", \"1.2\": \"Key Idea 2 of 4: .... than a genui...",
+    "tags": null
+  }
+]

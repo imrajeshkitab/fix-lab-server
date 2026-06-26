@@ -1,0 +1,21 @@
+create table public.fix_lab_job_items (
+  id uuid not null default gen_random_uuid (),
+  job_id uuid null,
+  bite_id uuid not null,
+  assignment_id uuid null,
+  language text not null,
+  status text not null default 'pending'::text,
+  error text null,
+  result jsonb null,
+  created_at timestamp with time zone null default now(),
+  from_version integer null,
+  new_version integer null,
+  new_round integer null,
+  uploaded_url text null,
+  uploaded_at timestamp with time zone null,
+  storage_verified boolean null,
+  assignment_fixed boolean null,
+  assignment_fix_error text null,
+  constraint fix_lab_job_items_pkey primary key (id),
+  constraint fix_lab_job_items_job_id_fkey foreign KEY (job_id) references fix_lab_jobs (id)
+) TABLESPACE pg_default;
