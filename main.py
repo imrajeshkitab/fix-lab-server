@@ -3017,16 +3017,16 @@ async def update_schedule(
 
 # ── Queue-empty notification worker ─────────────────────────────────────────
 
-ADMIN_BASE_URL = os.getenv(
-    "ADMIN_BASE_URL",
-    "https://kitab-gallery.vercel.app",
+RMS_BASE_URL = os.getenv(
+    "RMS_BASE_URL",
+    "https://kitab-cover-view.vercel.app",
 ).rstrip("/")
 
 
 def _build_queue_empty_email(reviewer_name: str, reviewer_id: str, done_24h: int) -> tuple:
     """Returns (subject, html) for the queue-empty alert."""
     safe_name = (reviewer_name or "Reviewer").strip()
-    cta_url = f"{ADMIN_BASE_URL}/admin?tab=assignments&reviewer={reviewer_id}"
+    cta_url = f"{RMS_BASE_URL}/admin?tab=assignments&reviewer={reviewer_id}"
     subject = f"{safe_name} cleared their queue — assign more?"
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
