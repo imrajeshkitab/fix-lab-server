@@ -3026,7 +3026,9 @@ RMS_BASE_URL = os.getenv(
 def _build_queue_empty_email(reviewer_name: str, reviewer_id: str, done_24h: int) -> tuple:
     """Returns (subject, html) for the queue-empty alert."""
     safe_name = (reviewer_name or "Reviewer").strip()
-    cta_url = f"{RMS_BASE_URL}/admin?tab=assignments&reviewer={reviewer_id}"
+    # Use `assignTo` (not `reviewer`) — the latter is already consumed by the
+    # admin's reviewerFilter and would override the Unassigned-Only default.
+    cta_url = f"{RMS_BASE_URL}/admin?tab=assignments&assignTo={reviewer_id}"
     subject = f"{safe_name} cleared their queue — assign more?"
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8">
