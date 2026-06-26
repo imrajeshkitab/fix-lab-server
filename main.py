@@ -3107,7 +3107,13 @@ async def _process_one_reviewer_finish_check(target: dict) -> None:
 
     # Require recent activity — otherwise this is an idle-empty queue, not a
     # "just finished" event worth pinging supervisors about.
-    since_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    # Use 'Z' suffix rather than '+00:00' — a literal '+' in the URL query
+    # string is interpreted as a space by httpx, so PostgREST rejects the
+    # timestamp ("invalid input syntax for type timestamp with time zone").
+    since_iso = (
+        (datetime.now(timezone.utc) - timedelta(hours=24))
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
     activity = await sb_get(
         f"content_assignments?reviewer_id=eq.{rid}"
         f"&status=in.(completed,changes_requested)"
