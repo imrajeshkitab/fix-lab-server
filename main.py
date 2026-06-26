@@ -2581,9 +2581,18 @@ def verify_reports_secret(x_reports_secret: str = Header(...)):
     return True
 
 
-# verify_reports_admin_secret removed — Reports admin UI no longer requires a
-# separate secret key.  Access is controlled by the admin dashboard's Supabase
-# Auth login.  The cron webhook (verify_reports_webhook_secret) is unaffected.
+def verify_reports_admin_secret(x_reports_admin_key: str) -> bool:
+    """Auth for Reports admin endpoints (schedule read/update, etc.).
+    Backed by REPORTS_ADMIN_SECRET env var; the frontend bakes the matching
+    value in via VITE_REPORTS_ADMIN_KEY at build time."""
+    if not REPORTS_ADMIN_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Reports admin not configured: set REPORTS_ADMIN_SECRET env var"
+        )
+    if x_reports_admin_key != REPORTS_ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid reports admin key")
+    return True
 
 
 @app.post("/api/reports/run-daily")
