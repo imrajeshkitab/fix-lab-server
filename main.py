@@ -3104,8 +3104,36 @@ async def _process_one_reviewer_finish_check(target: dict) -> None:
 
     # pending == 0 from here on
     if prior and not prior.get("cleared"):
-        logger.info(f"queue-empty: already notified for {name} ({rid}); skipping")
-        return
+        # The DB trigger only fires on UPDATE OF status, not INSERT — so when
+        # a reviewer is reassigned (pending 0 → 1 via INSERT) and then finishes
+        # again, the 'cleared' flag never got flipped and we'd treat the second
+        # queue-empty as a dupe. Re-arm by detecting any assignment created
+        # after the prior notification.
+        notified_at_raw = prior.get("notified_at") or ""
+        # PostgREST/httpx: a literal '+' in a URL query is parsed as a space,
+        # so URL-encode it (quote_plus would also escape '/' which we want kept).
+        notified_at_enc = notified_at_raw.replace("+", "%2B")
+        if notified_at_enc:
+            fresh_rows = await sb_get(
+                f"content_assignments?reviewer_id=eq.{rid}"
+                f"&assigned_at=gt.{notified_at_enc}&select=id&limit=1"
+            )
+            if fresh_rows:
+                await sb_patch_where(
+                    "reviewer_finish_notifications",
+                    f"reviewer_id=eq.{rid}",
+                    {"cleared": True},
+                )
+                # fall through to send a fresh email
+            else:
+                logger.info(
+                    f"queue-empty: already notified for {name} ({rid}) "
+                    f"and no new assignments since; skipping"
+                )
+                return
+        else:
+            logger.info(f"queue-empty: already notified for {name} ({rid}); skipping")
+            return
 
     # Require recent activity — otherwise this is an idle-empty queue, not a
     # "just finished" event worth pinging supervisors about.
