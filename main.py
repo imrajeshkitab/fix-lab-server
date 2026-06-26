@@ -222,8 +222,11 @@ async def sb_insert(table: str, data: dict) -> Any:
         json=data,
     )
     if r.status_code not in (200, 201):
-        logger.error(f"Supabase INSERT {table} failed: {r.status_code} {r.text[:300]}")
-        raise Exception(f"Supabase insert error: {r.status_code}")
+        body = (r.text or "")[:300]
+        logger.error(f"Supabase INSERT {table} failed: {r.status_code} {body}")
+        # Include the PG error body so callers can substring-match on
+        # "duplicate"/"unique" to translate UNIQUE violations into a 409.
+        raise Exception(f"Supabase insert error: {r.status_code} {body}")
     result = r.json()
     return result[0] if isinstance(result, list) else result
 
