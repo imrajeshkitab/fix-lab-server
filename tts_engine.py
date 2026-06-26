@@ -13,7 +13,7 @@ import logging
 logger = logging.getLogger("fix-lab.tts")
 
 # Path to TTS scripts
-TTS_DIR = os.path.join(os.path.dirname(__file__), "..", "TTS-scripts")
+TTS_DIR = os.path.join(os.path.dirname(__file__), "TTS-scripts")
 
 # ── Import modules with dots in filenames ───────────────────────────────────
 

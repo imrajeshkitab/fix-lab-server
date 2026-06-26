@@ -1,0 +1,53 @@
+[
+  {
+    "idx": 0,
+    "id": "fa86e29f-8020-4c56-be6a-14de5bb2d58e",
+    "created_at": "2026-02-11 11:03:28.224809+00",
+    "updated_at": "2026-02-11 11:03:28.224809+00",
+    "cover": "https://ziifsmeagbyyjsnmxwns.supabase.co/storage/v1/object/public/content/bytes/cover-pages/fa86e29f-8020-4c56-be6a-14de5bb2d58e.webp",
+    "source_id": "fa86e29f-8020-4c56-be6a-14de5bb2d58e",
+    "author": "Clara Smith",
+    "title": "Every Second Counts",
+    "audio": {
+      "en": {
+        "url": "https://kijxqpprmvywetklzhbg.supabase.co/storage/v1/object/public/RMS-content/bites/audio/english/round1/fa86e29f-8020-4c56-be6a-14de5bb2d58e.mp3",
+        "type": "mp3",
+        "duration": "02:35",
+        "language": "en",
+        "vo_artist": "Monika Sogam"
+      },
+      "hi": {
+        "url": "https://kijxqpprmvywetklzhbg.supabase.co/storage/v1/object/public/RMS-content/bites/audio/hindi/round1/fa86e29f-8020-4c56-be6a-14de5bb2d58e.mp3",
+        "type": "mp3",
+        "duration": "02:34",
+        "language": "hi",
+        "vo_artist": "Monika Sogam"
+      }
+    },
+    "content": {
+      "en": "Imagine waking ....... The clock is always running—make sure you're the one holding the pen.",
+      "hi": "\"टाइम ही नहीं है!\" – यह लाइन हम सब कितनी बार बोलते और सुनते हैं, है न? .... दिन को खुद को चलाने मत दीजिए।"
+    },
+    "source": "hfn",
+    "tags": [
+      "hfn",
+      "en_b1_r1",
+      "hi_b1_r1"
+    ],
+    "audio_version": {
+      "en": 1,
+      "hi": 1
+    },
+    "linear_identifier": "BYT-99",
+    "difficulty": "beginner",
+    "category": "Productivity",
+    "author_bilingual": {
+      "en": "Clara Smith",
+      "hi": "क्लारा स्मिथ"
+    },
+    "title_bilingual": {
+      "en": "Every Second Counts",
+      "hi": "एवरी सेकंड काउंट्स"
+    }
+  }
+]

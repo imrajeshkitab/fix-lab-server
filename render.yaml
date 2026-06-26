@@ -11,6 +11,10 @@ services:
         sync: false
       - key: ELEVEN_LABS_API_KEY
         sync: false
+      - key: STORAGE_SUPABASE_URL
+        sync: false
+      - key: STORAGE_SUPABASE_SERVICE_KEY
+        sync: false
       - key: FIX_LAB_SECRET
         sync: false
       - key: PORT
