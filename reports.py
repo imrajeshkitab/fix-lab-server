@@ -63,20 +63,24 @@ def headline_summary(payload: dict) -> dict:
 # ──────────────────────────── HTML rendering ─────────────────────────────────
 
 _CSS = """
-    body { font-family: -apple-system, system-ui, sans-serif; color: #1f2937; line-height: 1.5; max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    body { font-family: -apple-system, system-ui, sans-serif; color: #1f2937; line-height: 1.5; max-width: 760px; margin: 24px auto; padding: 0 16px; }
     h1 { font-size: 18px; margin: 0 0 4px; color: #0f172a; }
     .subtitle { color: #6b7280; font-size: 13px; margin-bottom: 24px; }
     h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; color: #475569; margin: 28px 0 12px; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; }
+    h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; color: #64748b; margin: 16px 0 8px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 8px; }
     th { background: #f8fafc; text-align: left; padding: 8px 10px; font-weight: 600; color: #475569; border-bottom: 1px solid #e5e7eb; }
-    td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
+    td { padding: 8px 10px; border-bottom: 1px solid #f1f5f9; vertical-align: middle; }
     td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    td.dim { color: #94a3b8; }
     tr.total td { font-weight: 700; background: #f8fafc; border-top: 2px solid #cbd5e1; }
+    tr.inactive td { color: #94a3b8; background: #fafafa; }
     .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; }
     .pill-green { background: #dcfce7; color: #166534; }
     .pill-amber { background: #fef3c7; color: #92400e; }
     .pill-red { background: #fee2e2; color: #991b1b; }
     .pill-blue { background: #dbeafe; color: #1e40af; }
+    .pill-slate { background: #f1f5f9; color: #475569; }
     ul { padding-left: 20px; margin: 8px 0; }
     .available-row { color: #166534; font-weight: 500; }
     .footer { color: #9ca3af; font-size: 11px; margin-top: 32px; padding-top: 16px; border-top: 1px solid #f1f5f9; }
@@ -84,6 +88,18 @@ _CSS = """
     .delta-negative { color: #15803d; }
     .delta-zero { color: #6b7280; }
     .spark { font-family: monospace; white-space: pre; font-size: 12px; line-height: 1.2; }
+    .kpi-row { font-size: 13px; margin: 4px 0 16px; }
+    .kpi-row .pill { margin-right: 6px; }
+    .bar-cell { padding: 4px 10px; }
+    .bar-track { background:#f1f5f9; border-radius: 4px; height: 14px; width: 140px; position: relative; overflow: hidden; }
+    .bar-fill { background: #3b82f6; height: 100%; border-radius: 4px; }
+    .bar-fill.warn { background: #f59e0b; }
+    .bar-fill.danger { background: #ef4444; }
+    .bar-fill.muted { background: #cbd5e1; }
+    .twocol { width: 100%; }
+    .twocol td { vertical-align: top; padding: 0; border: none; }
+    .twocol td.left { padding-right: 12px; }
+    .twocol td.right { padding-left: 12px; }
 """
 
 
@@ -99,12 +115,11 @@ def _fmt_content_type(ct: str) -> str:
     return ct.title() if ct else "—"
 
 
-def _render_progress_table(progress: list) -> str:
-    """Section 1 — progress matrix for the last 24 hours."""
+def _render_progress_table(progress: list, window_label: str = "last 24 hours") -> str:
+    """Progress matrix for a given window (24h or 7d)."""
     if not progress:
-        return "<p style='color:#6b7280'>No reviewer activity in the last 24 hours.</p>"
+        return f"<p style='color:#6b7280'>No reviewer activity in the {window_label}.</p>"
 
-    # Group by (content_type, language) for stable ordering
     rows = sorted(progress, key=lambda r: (r.get("content_type", ""), r.get("language", "")))
     total_approved = sum(r.get("approved", 0) for r in rows)
     total_corrected = sum(r.get("corrected", 0) for r in rows)
@@ -116,7 +131,7 @@ def _render_progress_table(progress: list) -> str:
           <th>Content</th>
           <th>Language</th>
           <th class="num">✅ Approved</th>
-          <th class="num">🔧 Sent for correction</th>
+          <th class="num">🔧 Corrected</th>
           <th class="num">Total moved</th>
         </tr>
       </thead>
@@ -142,6 +157,22 @@ def _render_progress_table(progress: list) -> str:
     </table>
     """
     return body
+
+
+def _render_progress_side_by_side(progress_24h: list, progress_7d: list) -> str:
+    """Two progress tables side-by-side: 24h vs 7d."""
+    return f"""
+    <table class="twocol"><tr>
+      <td class="left">
+        <h3>Last 24 hours</h3>
+        {_render_progress_table(progress_24h, "last 24 hours")}
+      </td>
+      <td class="right">
+        <h3>Last 7 days</h3>
+        {_render_progress_table(progress_7d, "last 7 days")}
+      </td>
+    </tr></table>
+    """
 
 
 def _render_snapshot_table(snapshot: list) -> str:
@@ -224,54 +255,109 @@ def _render_delta(delta: dict) -> str:
     """
 
 
-def _render_reviewers(reviewers: dict) -> str:
-    if not reviewers:
-        return "<p style='color:#6b7280'>No reviewer data.</p>"
-
-    available = reviewers.get("available") or []
-    active = reviewers.get("active") or []
-
-    html_out = ""
-
-    # Available
-    if available:
-        items = "".join(f"<li class='available-row'>🟢 {_esc(n)}</li>" for n in available)
-        html_out += f"""
-        <p><strong>Available reviewers</strong> (no pending work):</p>
-        <ul>{items}</ul>
-        """
+def _bar(value: int, max_value: int, kind: str = "") -> str:
+    """Inline CSS horizontal bar (email-safe). kind ∈ {'', 'warn', 'danger', 'muted'}."""
+    if max_value <= 0:
+        pct = 0
     else:
-        html_out += "<p style='color:#6b7280'>No reviewers are fully available right now.</p>"
+        pct = min(100, int(round((value / max_value) * 100)))
+    cls = f"bar-fill {kind}".strip()
+    return (
+        f'<div class="bar-track">'
+        f'<div class="{cls}" style="width:{pct}%"></div>'
+        f'</div>'
+    )
 
-    # Active
-    if active:
-        rows_html = ""
-        for r in active:
-            avg = r.get("avg_rating")
-            avg_str = f"{float(avg):.1f}" if avg is not None else "—"
-            rows_html += f"""
-            <tr>
-              <td>{_esc(r.get('name'))}</td>
-              <td class="num">{_esc(r.get('done_24h', 0))}</td>
-              <td class="num">{_esc(r.get('pending', 0))}</td>
-              <td class="num">{avg_str}</td>
-            </tr>"""
-        html_out += f"""
-        <p style="margin-top:16px;"><strong>Active reviewers</strong>:</p>
-        <table>
-          <thead>
-            <tr>
-              <th>Reviewer</th>
-              <th class="num">Done (24h)</th>
-              <th class="num">Pending</th>
-              <th class="num">Avg ⭐ given</th>
-            </tr>
-          </thead>
-          <tbody>{rows_html}</tbody>
-        </table>
-        """
 
-    return html_out
+def _render_activity_kpis(reviewers: dict) -> str:
+    """Compact KPI line: active 24h vs 7d counts."""
+    a24 = reviewers.get("active_24h") or {}
+    a7 = reviewers.get("active_7d") or {}
+    available = reviewers.get("available") or []
+    return f"""
+    <div class="kpi-row">
+      <span class="pill pill-green">Active 24h · {int(a24.get('count') or 0)}</span>
+      <span class="pill pill-blue">Active 7d · {int(a7.get('count') or 0)}</span>
+      <span class="pill pill-slate">Available · {len(available)}</span>
+    </div>
+    """
+
+
+def _render_near_finish(near_finish: list) -> str:
+    """Reviewers about to wrap up (pending ≤ 5 AND active in last 7d)."""
+    if not near_finish:
+        return "<p style='color:#6b7280'>No reviewers are near finish right now.</p>"
+    items = "".join(
+        f"<li><strong>{_esc(r.get('name'))}</strong> — "
+        f"<span class='pill pill-amber'>{int(r.get('pending') or 0)} left</span> "
+        f"<span style='color:#94a3b8;font-size:12px;'>· {int(r.get('done_7d') or 0)} done in 7d</span></li>"
+        for r in near_finish
+    )
+    return f"""
+    <p style="font-size:13px;color:#475569;margin:0 0 6px;">
+      Reviewers with ≤5 pending items and recent activity — consider assigning a fresh batch.
+    </p>
+    <ul>{items}</ul>
+    """
+
+
+def _render_leaderboard(leaderboard: list) -> str:
+    """Per-reviewer table with HTML/CSS Done-7d bars."""
+    if not leaderboard:
+        return "<p style='color:#6b7280'>No reviewer activity to show.</p>"
+
+    max_done_7d = max((int(r.get("done_7d") or 0) for r in leaderboard), default=0) or 1
+
+    rows_html = ""
+    for r in leaderboard:
+        done_24h = int(r.get("done_24h") or 0)
+        done_7d = int(r.get("done_7d") or 0)
+        corrected_7d = int(r.get("corrected_7d") or 0)
+        pending = int(r.get("pending") or 0)
+        is_active_7d = bool(r.get("active_7d"))
+        row_cls = "" if is_active_7d else "inactive"
+        # Pending pill colour: amber if pending>0, slate otherwise
+        pending_html = (
+            f'<span class="pill pill-amber">{pending}</span>' if pending > 0
+            else '<span class="pill pill-slate">0</span>'
+        )
+        bar_kind = "" if is_active_7d else "muted"
+        rows_html += f"""
+        <tr class="{row_cls}">
+          <td>{_esc(r.get('name'))}</td>
+          <td class="num">{done_24h}</td>
+          <td class="num">{done_7d}</td>
+          <td class="bar-cell">{_bar(done_7d, max_done_7d, bar_kind)}</td>
+          <td class="num">{corrected_7d}</td>
+          <td class="num">{pending_html}</td>
+        </tr>"""
+
+    return f"""
+    <table>
+      <thead>
+        <tr>
+          <th>Reviewer</th>
+          <th class="num">Done 24h</th>
+          <th class="num">Done 7d</th>
+          <th>&nbsp;</th>
+          <th class="num">🔧 Corrected 7d</th>
+          <th class="num">Pending</th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    <p style="font-size:11px;color:#94a3b8;margin-top:4px;">
+      Rows in grey have no activity in the last 7 days (still hold pending items).
+    </p>
+    """
+
+
+def _render_available(reviewers: dict) -> str:
+    available = reviewers.get("available") or []
+    if not available:
+        return "<p style='color:#6b7280'>No reviewers are fully available right now.</p>"
+    items = "".join(f"<li class='available-row'>🟢 {_esc(n)}</li>" for n in available)
+    return f"<ul>{items}</ul>"
 
 
 def _render_throughput(throughput: list) -> str:
@@ -306,10 +392,13 @@ def render_html(payload: dict) -> str:
     now_local = datetime.now(ist)
     date_str = now_local.strftime("%a, %d %b %Y · %H:%M IST")
 
-    progress = payload.get("progress_24h") or []
+    progress_24h = payload.get("progress_24h") or []
+    progress_7d = payload.get("progress_7d") or []
     snapshot = payload.get("snapshot") or []
     delta = payload.get("delta") or {}
     reviewers = payload.get("reviewers") or {}
+    leaderboard = reviewers.get("leaderboard") or []
+    near_finish = reviewers.get("near_finish") or []
     throughput = payload.get("throughput_7d") or []
 
     return f"""<!doctype html>
@@ -317,15 +406,24 @@ def render_html(payload: dict) -> str:
   <h1>📊 Kitab Reviews — Daily Progress Report</h1>
   <div class="subtitle">{_esc(date_str)} · window: last 24 hours</div>
 
-  <h2>1. Progress (last 24 hours)</h2>
-  {_render_progress_table(progress)}
+  <h2>1. Movement summary</h2>
+  {_render_progress_side_by_side(progress_24h, progress_7d)}
   {_render_delta(delta)}
 
   <h2>2. Backlog &amp; Status snapshot</h2>
   {_render_snapshot_table(snapshot)}
 
   <h2>3. Reviewer activity</h2>
-  {_render_reviewers(reviewers)}
+  {_render_activity_kpis(reviewers)}
+
+  <h3>Near finish (≤ 5 pending)</h3>
+  {_render_near_finish(near_finish)}
+
+  <h3>Reviewer leaderboard</h3>
+  {_render_leaderboard(leaderboard)}
+
+  <h3>Available reviewers (no pending work)</h3>
+  {_render_available(reviewers)}
 
   <h2>4. Throughput — last 7 days</h2>
   {_render_throughput(throughput)}
